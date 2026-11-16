@@ -1,0 +1,19 @@
+# Archivos de compilación de Cargo
+/target/
+
+# Configuración local y secretos
+.env
+.env.*
+!.env.example
+
+# Archivos temporales de editores y del sistema
+.vs/
+.idea/
+*.swp
+*.swo
+*~
+Thumbs.db
+Desktop.ini
+
+# Archivos de diagnóstico generados
+*.log
