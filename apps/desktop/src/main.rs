@@ -19,7 +19,8 @@ mod theme;
 
 use crate::{
     layout::{
-        GoDashboard, GoSettings, QuitApp, RunDiagnostics, ShowAbout, ToggleSidebar, ToggleTheme,
+        FocusGlobalSearch, GoDashboard, GoSettings, QuitApp, RunDiagnostics, ShowAbout,
+        ToggleSidebar, ToggleTheme,
     },
     services::DesktopError,
 };
@@ -29,6 +30,7 @@ fn main() {
         .with_assets(assets::AppAssets)
         .run(|cx| {
             init(cx);
+            cx.bind_keys([gpui_kit::KeyBinding::new("ctrl-k", FocusGlobalSearch, None)]);
 
             cx.set_menus([
                 Menu::new("Archivo").items([

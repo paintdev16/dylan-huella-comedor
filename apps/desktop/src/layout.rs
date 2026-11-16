@@ -1,9 +1,11 @@
 use gpui_kit::{
-    AppContext as _, Context, Entity, FocusHandle, InteractiveElement as _, IntoElement,
-    ParentElement, Render, SharedString, Styled, Subscription, Task, Window, actions,
+    AppContext as _, Context, Entity, FocusHandle, Focusable as _, InteractiveElement as _,
+    IntoElement, ParentElement, Render, SharedString, Styled, Subscription, Task, Window, actions,
     component::{
         ActiveTheme as _, Disableable as _, IconName, Side, Sizable as _, ThemeMode, TitleBar,
         button::{Button, ButtonVariants as _},
+        combobox::{Combobox, ComboboxEvent, ComboboxState},
+        searchable_list::SearchableVec,
         h_flex,
         menu::{AppMenuBar, DropdownMenu as _, PopupMenuItem},
         input::{InputEvent, InputState},
@@ -23,7 +25,7 @@ use crate::{
     auth::{AuthError, AuthService, AuthStatus, MockAuthService},
     biometric_service::{BiometricGateway as _, SimulatedBiometricGateway},
     components::{common, sidebar},
-    login, mock_data, pages, services,
+    login, mock_data, pages::{self, identification::{GlobalPensionerChoice, build_global_pensioner_choices}}, services,
     settings_store::{
         AppPreferences, BiometricBackupStatus, OsCredentialVaultPlaceholder,
         ServerConnectionStatus, ThemePreference, default_preferences_path, load_preferences_from,
@@ -42,6 +44,7 @@ actions!(
         RunDiagnostics,
         ShowAbout,
         QuitApp,
+        FocusGlobalSearch,
     ]
 );
 
@@ -70,22 +73,13 @@ pub struct DesktopApp {
     pub(crate) biometric_modal_open: bool,
     pub(crate) pending_auto_modal_pensioner: Option<u32>,
     pub(crate) pending_biometric_notice: Option<(bool, SharedString)>,
-    pub(crate) pending_consumption_pensioner: Option<u32>,
-    pub(crate) consumption_search: Entity<InputState>,
-    pub(crate) consumption_special_price: Entity<InputState>,
-    pub(crate) consumption_special_desc: Entity<InputState>,
-    pub(crate) consumption_third_party_name: Entity<InputState>,
-    pub(crate) consumption_meal: mock_data::Meal,
-    pub(crate) consumption_menu_kind: mock_data::MenuKind,
-    pub(crate) consumption_portions: u32,
-    pub(crate) consumption_third_party: bool,
+    pub(crate) global_pensioner_combobox: Entity<ComboboxState<SearchableVec<GlobalPensionerChoice>>>,
+    pub(crate) global_search_last_items: Vec<GlobalPensionerChoice>,
+    pub(crate) pending_global_search_clear: bool,
+    _global_search_subscription: Subscription,
     pub(crate) consumption_pricing: mock_data::ConsumptionPricing,
-    pub(crate) consumption_draft: Vec<mock_data::DraftConsumptionItem>,
-    pub(crate) consumption_next_draft_id: u64,
     pub(crate) consumption_confirm_token: u64,
     pub(crate) consumption_processed_tokens: std::collections::HashSet<u64>,
-    pub(crate) consumption_submitting: bool,
-    _consumption_subscriptions: [Subscription; 2],
     pub(crate) cash_search: Entity<InputState>,
     pub(crate) cash_amount_input: Entity<InputState>,
     pub(crate) cash_discount_reason_input: Entity<InputState>,
@@ -125,6 +119,17 @@ pub struct DesktopApp {
 }
 
 impl DesktopApp {
+    pub fn focus_global_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.state.auth.user().is_some_and(|u| u.can("consumptions.create"))
+            || self.biometric_modal_open || window.has_active_dialog(cx) { return; }
+        self.global_pensioner_combobox.update(cx, |cb, cx| cb.focus(window, cx));
+        let focus = self.global_pensioner_combobox.read(cx).focus_handle(cx);
+        window.defer(cx, move |window, cx| {
+            if focus.is_focused(window) && !window.has_active_dialog(cx) {
+                window.dispatch_action(Box::new(gpui_kit::base::actions::SelectDown), cx);
+            }
+        });
+    }
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let menu_bar = AppMenuBar::new(cx);
         let focus_handle = cx.focus_handle();
@@ -138,30 +143,28 @@ impl DesktopApp {
         let search_subscription = cx.subscribe_in(&pensioner_search, window, |_, _, event, _, cx| {
             if matches!(event, InputEvent::Change) { cx.notify(); }
         });
-        let consumption_search = cx.new(|cx| InputState::new(window, cx).placeholder("Buscar pensionista por nombre, ID o celular"));
-        let consumption_search_sub = cx.subscribe_in(&consumption_search, window, |_, _, event, _, cx| {
-            if matches!(event, InputEvent::Change) { cx.notify(); }
+        let global_pensioner_combobox = cx.new(|cx| {
+            ComboboxState::new(SearchableVec::<GlobalPensionerChoice>::new(vec![]), vec![], window, cx)
+                .multiple(false)
+                .searchable(true)
         });
+        let global_search_sub = cx.subscribe_in(
+            &global_pensioner_combobox,
+            window,
+            |this, _, event: &ComboboxEvent<SearchableVec<GlobalPensionerChoice>>, window, cx| {
+                if let ComboboxEvent::Confirm(values) = event {
+                    if let Some(&pensioner_id) = values.first() {
+                        this.open_manual_consumption_modal(pensioner_id, window, cx);
+                    }
+                }
+            },
+        );
         let preferences = load_preferences_from(&default_preferences_path()).unwrap_or_default();
         let consumption_pricing = mock_data::ConsumptionPricing {
             economic_breakfast_cents: preferences.economic_breakfast_cents,
             economic_lunch_cents: preferences.economic_lunch_cents,
             special_default_cents: preferences.special_default_cents,
         };
-        let consumption_special_price = cx.new(|cx| {
-            InputState::new(window, cx)
-                .placeholder("12.00")
-                .default_value(format!(
-                    "{}.{:02}",
-                    consumption_pricing.special_default_cents / 100,
-                    consumption_pricing.special_default_cents.abs() % 100
-                ))
-        });
-        let consumption_price_sub = cx.subscribe_in(&consumption_special_price, window, |_, _, event, _, cx| {
-            if matches!(event, InputEvent::Change) { cx.notify(); }
-        });
-        let consumption_special_desc = cx.new(|cx| InputState::new(window, cx).placeholder("Ej. Seco a la norteña"));
-        let consumption_third_party_name = cx.new(|cx| InputState::new(window, cx).placeholder("Nombre completo de quien recoge"));
         let cash_search = cx.new(|cx| InputState::new(window, cx).placeholder("Buscar pensionista por nombre, ID o celular"));
         let cash_search_sub = cx.subscribe_in(&cash_search, window, |_, _, event, _, cx| {
             if matches!(event, InputEvent::Change) { cx.notify(); }
@@ -256,22 +259,13 @@ impl DesktopApp {
             biometric_modal_open: false,
             pending_auto_modal_pensioner: None,
             pending_biometric_notice: None,
-            pending_consumption_pensioner: None,
-            consumption_search,
-            consumption_special_price,
-            consumption_special_desc,
-            consumption_third_party_name,
-            consumption_meal: mock_data::Meal::Lunch,
-            consumption_menu_kind: mock_data::MenuKind::Economic,
-            consumption_portions: 1,
-            consumption_third_party: false,
+            global_pensioner_combobox,
+            global_search_last_items: Vec::new(),
+            pending_global_search_clear: false,
+            _global_search_subscription: global_search_sub,
             consumption_pricing,
-            consumption_draft: Vec::new(),
-            consumption_next_draft_id: 0,
             consumption_confirm_token: 1,
             consumption_processed_tokens: std::collections::HashSet::new(),
-            consumption_submitting: false,
-            _consumption_subscriptions: [consumption_search_sub, consumption_price_sub],
             cash_search,
             cash_amount_input,
             cash_discount_reason_input,
@@ -318,7 +312,6 @@ impl DesktopApp {
     pub fn navigate_to(&mut self, page: Page, cx: &mut Context<Self>) {
         if self.state.auth.user().is_none() { return; }
         if !self.state.auth.can_view(page) { self.denied = true; cx.notify(); return; }
-        if page != Page::Consumos { self.pending_consumption_pensioner = None; }
         self.denied = false;
         let was_selected = self.selected_pensioner.take().is_some();
         if self.state.push_page(page) || was_selected {
@@ -330,7 +323,6 @@ impl DesktopApp {
         if self.state.auth.user().is_none() { return; }
         self.denied = false;
         if self.state.go_back() {
-            if self.state.page != Page::Consumos { self.pending_consumption_pensioner = None; }
             cx.notify();
         }
     }
@@ -339,7 +331,6 @@ impl DesktopApp {
         if self.state.auth.user().is_none() { return; }
         self.denied = false;
         if self.state.go_forward() {
-            if self.state.page != Page::Consumos { self.pending_consumption_pensioner = None; }
             cx.notify();
         }
     }
@@ -390,9 +381,9 @@ impl DesktopApp {
         self.biometric_modal_open = false;
         self.pending_auto_modal_pensioner = None;
         self.pending_biometric_notice = None;
+        self.pending_global_search_clear = true;
         self.biometric_gateway.disconnect();
         self.biometric_event_log.clear();
-        self.pending_consumption_pensioner = None;
         self.state.auth = AuthStatus::Unauthenticated;
         self.selected_pensioner = None;
         self.state.user = Default::default();
@@ -577,6 +568,37 @@ impl Render for DesktopApp {
                 );
             });
         }
+        if self.pending_global_search_clear {
+            self.pending_global_search_clear = false;
+            let entity = cx.entity().downgrade();
+            window.defer(cx, move |window, cx| {
+                let _ = entity.update(cx, |app, cx| {
+                    app.global_pensioner_combobox.update(cx, |cb, cx| {
+                        cb.clear_selection(cx);
+                        cb.set_query("", window, cx);
+                        if !window.has_active_dialog(cx) && app.state.auth.user().is_some_and(|u| u.can("consumptions.create")) {
+                            cb.focus(window, cx);
+                        }
+                    });
+                });
+            });
+        }
+        if let DataStatus::Ready(data) = &self.state.data {
+            let items = build_global_pensioner_choices(data);
+            if items != self.global_search_last_items {
+                self.global_search_last_items = items.clone();
+                let entity = cx.entity().downgrade();
+                window.defer(cx, move |window, cx| {
+                    let _ = entity.update(cx, |app, cx| {
+                        app.global_pensioner_combobox.update(cx, |cb, cx| {
+                            let query = cb.query(cx);
+                            cb.set_items(SearchableVec::new(items), window, cx);
+                            cb.set_query(query, window, cx);
+                        });
+                    });
+                });
+            }
+        }
         let compact = window.viewport_size().width < px(760.);
         if compact != self.compact {
             if compact {
@@ -600,6 +622,11 @@ impl Render for DesktopApp {
         let account_role = self.state.user.role.clone();
         let bio_connected = self.biometric_gateway.state().is_connected();
         let bio_label = self.biometric_gateway.state().label();
+        let can_create_consumption = self
+            .state
+            .auth
+            .user()
+            .is_some_and(|u| u.can("consumptions.create"));
         let title = if !signed_in {
             "Comedor".to_string()
         } else if self.denied || !self.state.auth.can_view(self.state.page) {
@@ -638,6 +665,9 @@ impl Render for DesktopApp {
             .on_action(|_: &QuitApp, _, cx| {
                 cx.quit();
             })
+            .on_action(cx.listener(|this, _: &FocusGlobalSearch, window, cx| {
+                this.focus_global_search(window, cx);
+            }))
             .bg(bg)
             .text_color(fg)
             .child(
@@ -722,6 +752,22 @@ impl Render for DesktopApp {
                         .occlude()
                         .gap_2()
                         .items_center()
+                        .when(can_create_consumption, |this| {
+                            this.child(
+                                gpui_kit::div()
+                                    .w(px(240.))
+                                    .child(
+                                        Combobox::new(&self.global_pensioner_combobox)
+                                            .xsmall()
+                                            .icon(LucideIcon::Search)
+                                            .placeholder("Buscar pensionista (Ctrl+K)")
+                                            .search_placeholder("Nombre, #ID o celular…")
+                                            .menu_width(px(360.))
+                                            .cleanable(true)
+                                            .disabled(self.biometric_modal_open),
+                                    ),
+                            )
+                        })
                         .when(bio_connected, |this| {
                             this.child(
                                 Tag::secondary()

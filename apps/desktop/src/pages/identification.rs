@@ -1,29 +1,31 @@
 use std::{
-    sync::{Arc, Mutex, mpsc},
+    sync::{mpsc, Arc, Mutex},
     time::Duration,
 };
 
+use chrono::Timelike as _;
 use gpui_kit::{
-    App, AppContext as _, Context, FontWeight, IntoElement, ParentElement, SharedString,
-    Styled, Window,
     assets::IconName as LucideIcon,
     component::{
-        ActiveTheme as _, Disableable as _, Icon, Sizable as _, WindowExt as _,
         alert::Alert,
         button::{Button, ButtonVariants as _},
         group_box::{GroupBox, GroupBoxVariants as _},
         h_flex,
         input::{Input, InputState},
         notification::Notification,
+        searchable_list::SearchableListItem,
+        select::{Select, SelectEvent, SelectState},
         spinner::Spinner,
         switch::Switch,
         tag::Tag,
-        v_flex,
+        v_flex, ActiveTheme as _, Disableable as _, Icon, IndexPath, Sizable as _, WindowExt as _,
     },
     div,
     prelude::FluentBuilder as _,
-    px,
+    px, App, AppContext as _, Context, FontWeight, IntoElement, ParentElement, SharedString,
+    Styled, Subscription, Window,
 };
+use unicode_normalization::{char::is_combining_mark, UnicodeNormalization};
 
 use crate::{
     biometric_service::{
@@ -31,7 +33,7 @@ use crate::{
         ContinuousBiometricSignal, IdentificationOutcome, SimulatedBiometricGateway,
     },
     layout::DesktopApp,
-    mock_data::{DraftConsumptionItem, Meal, MenuKind, parse_price_cents},
+    mock_data::{parse_price_cents, DraftConsumptionItem, Meal, MenuKind, MockData},
     state::{AppState, DataStatus, Page},
 };
 
@@ -70,16 +72,212 @@ fn state_tag(reader_state: &BiometricReaderState) -> Tag {
     }
 }
 
+/// Horario configurable para seleccionar inicialmente Desayuno o Almuerzo.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MealSchedule {
+    /// Hora límite exclusiva (0..=23) hasta la cual se preselecciona Desayuno.
+    pub breakfast_until_hour: u32,
+}
+
+impl Default for MealSchedule {
+    fn default() -> Self {
+        Self {
+            breakfast_until_hour: 11,
+        }
+    }
+}
+
+impl MealSchedule {
+    pub fn meal_for_hour(self, hour: u32) -> Meal {
+        if hour < self.breakfast_until_hour {
+            Meal::Breakfast
+        } else {
+            Meal::Lunch
+        }
+    }
+
+    pub fn current_meal(self) -> Meal {
+        self.meal_for_hour(chrono::Local::now().hour())
+    }
+}
+
 struct AutoModalState {
     meal: Meal,
     menu_kind: MenuKind,
     portions: u32,
     third_party: bool,
-    draft: Vec<DraftConsumptionItem>,
-    next_id: u64,
+    cart: Vec<DraftConsumptionItem>,
+    next_item_id: u64,
     error: Option<String>,
     submitting: bool,
     token: u64,
+    _meal_subscription: Option<Subscription>,
+}
+
+/// Normaliza texto para búsqueda insensible a mayúsculas y acentos.
+pub fn normalize_search_text(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    for ch in input.trim().nfd().filter(|c| !is_combining_mark(*c)) {
+        for lc in ch.to_lowercase() {
+            let mapped = match lc {
+                'á' | 'à' | 'ä' | 'â' | 'ã' | 'å' => 'a',
+                'é' | 'è' | 'ë' | 'ê' => 'e',
+                'í' | 'ì' | 'ï' | 'î' => 'i',
+                'ó' | 'ò' | 'ö' | 'ô' | 'õ' => 'o',
+                'ú' | 'ù' | 'ü' | 'û' => 'u',
+                'ñ' => 'n',
+                'ç' => 'c',
+                other => other,
+            };
+            out.push(mapped);
+        }
+    }
+    out
+}
+
+/// Elemento del Combobox global de búsqueda de pensionistas activos.
+#[derive(Clone, PartialEq, Eq)]
+pub struct GlobalPensionerChoice {
+    pub id: u32,
+    pub full_name: String,
+    pub phone: Option<String>,
+    pub biometric_id: Option<String>,
+    pub balance_cents: i64,
+}
+
+impl SearchableListItem for GlobalPensionerChoice {
+    type Value = u32;
+
+    fn title(&self) -> SharedString {
+        format!(
+            "{} · ID #{} · {}",
+            self.full_name,
+            self.id,
+            amount(self.balance_cents)
+        )
+        .into()
+    }
+
+    fn render(&self, _: &mut Window, app: &mut App) -> impl IntoElement {
+        let theme = app.theme();
+        h_flex()
+            .w_full()
+            .justify_between()
+            .items_center()
+            .gap_2()
+            .child(
+                v_flex()
+                    .gap_0p5()
+                    .min_w_0()
+                    .child(
+                        div()
+                            .text_xs()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .truncate()
+                            .child(self.full_name.clone()),
+                    )
+                    .child(div().text_xs().text_color(theme.muted_foreground).child(
+                        match &self.phone {
+                            Some(ph) if !ph.trim().is_empty() => {
+                                format!("ID #{} · {}", self.id, ph)
+                            }
+                            _ => format!("ID #{}", self.id),
+                        },
+                    )),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(if self.balance_cents > 0 {
+                        theme.warning
+                    } else {
+                        theme.muted_foreground
+                    })
+                    .child(amount(self.balance_cents)),
+            )
+    }
+
+    fn value(&self) -> &Self::Value {
+        &self.id
+    }
+
+    fn matches(&self, query: &str) -> bool {
+        let norm_query = normalize_search_text(query);
+        if norm_query.is_empty() {
+            return true;
+        }
+        let haystack = normalize_search_text(&format!(
+            "{} #{} {} {} {}",
+            self.full_name,
+            self.id,
+            self.id,
+            self.biometric_id.as_deref().unwrap_or(""),
+            self.phone.as_deref().unwrap_or("")
+        ));
+        norm_query
+            .split_whitespace()
+            .all(|tok| haystack.contains(tok))
+    }
+}
+
+/// Construye la lista de sugerencias del Combobox global solo con pensionistas activos.
+pub fn build_global_pensioner_choices(data: &MockData) -> Vec<GlobalPensionerChoice> {
+    let mut items: Vec<GlobalPensionerChoice> = data
+        .pensioners
+        .iter()
+        .filter(|p| p.active)
+        .map(|p| GlobalPensionerChoice {
+            id: p.id,
+            full_name: p.name(),
+            phone: p.phone.clone(),
+            biometric_id: p.biometric_id.clone(),
+            balance_cents: data.balance(p.id),
+        })
+        .collect();
+    items.sort_by_key(|p| p.id);
+    items
+}
+
+/// Agrega una selección al carrito mixto agrupando únicamente mismo turno, tipo y precio.
+fn add_to_mixed_cart(
+    cart: &mut Vec<DraftConsumptionItem>,
+    next_id: &mut u64,
+    meal: Meal,
+    menu_kind: MenuKind,
+    portions: u32,
+    unit_price_cents: i64,
+) -> Result<(), String> {
+    if portions == 0 {
+        return Err("La cantidad de raciones debe ser mayor a cero.".into());
+    }
+    if unit_price_cents <= 0 {
+        return Err("El precio unitario debe ser mayor a S/ 0.00.".into());
+    }
+
+    if let Some(existing) = cart.iter_mut().find(|item| {
+        item.meal == meal
+            && item.menu_kind == menu_kind
+            && item.unit_price_cents == unit_price_cents
+    }) {
+        existing.portions = existing.portions.saturating_add(portions);
+    } else {
+        let id = *next_id;
+        *next_id += 1;
+        let description = match menu_kind {
+            MenuKind::Economic => "Ración económica".to_string(),
+            MenuKind::Special => "Plato especial".to_string(),
+        };
+        cart.push(DraftConsumptionItem {
+            id,
+            meal,
+            menu_kind,
+            description,
+            portions,
+            unit_price_cents,
+        });
+    }
+    Ok(())
 }
 
 impl DesktopApp {
@@ -100,9 +298,11 @@ impl DesktopApp {
 
     /// Activa el servicio biométrico continuo al iniciar sesión si el usuario tiene permiso.
     pub fn activate_continuous_biometrics(&mut self, cx: &mut Context<Self>) {
-        let can_use = self.state.auth.user().is_some_and(|u| {
-            u.can("biometrics.identify") || u.can("biometrics.view")
-        });
+        let can_use = self
+            .state
+            .auth
+            .user()
+            .is_some_and(|u| u.can("biometrics.identify") || u.can("biometrics.view"));
         if !can_use {
             return;
         }
@@ -123,29 +323,31 @@ impl DesktopApp {
         self.biometric_signal_tx = Some(tx);
         let rx = Arc::new(Mutex::new(rx));
 
-        self.biometric_listener_task = Some(cx.spawn(async move |this, cx| {
-            loop {
-                let rx_clone = rx.clone();
-                let signal = cx
-                    .background_spawn(async move {
-                        let guard = rx_clone.lock().ok()?;
-                        guard.recv().ok()
-                    })
-                    .await;
-                let Some(sig) = signal else {
-                    break;
-                };
-                let ok = this.update(cx, |app, cx| {
-                    app.handle_continuous_signal(sig, cx);
-                });
-                if ok.is_err() {
-                    break;
-                }
+        self.biometric_listener_task = Some(cx.spawn(async move |this, cx| loop {
+            let rx_clone = rx.clone();
+            let signal = cx
+                .background_spawn(async move {
+                    let guard = rx_clone.lock().ok()?;
+                    guard.recv().ok()
+                })
+                .await;
+            let Some(sig) = signal else {
+                break;
+            };
+            let ok = this.update(cx, |app, cx| {
+                app.handle_continuous_signal(sig, cx);
+            });
+            if ok.is_err() {
+                break;
             }
         }));
     }
 
-    pub fn emit_biometric_signal(&mut self, signal: ContinuousBiometricSignal, cx: &mut Context<Self>) {
+    pub fn emit_biometric_signal(
+        &mut self,
+        signal: ContinuousBiometricSignal,
+        cx: &mut Context<Self>,
+    ) {
         self.handle_continuous_signal(signal, cx);
     }
 
@@ -155,7 +357,7 @@ impl DesktopApp {
         cx: &mut Context<Self>,
     ) {
         if !self.state.auth.can_view(Page::Identificacion)
-            && !allowed(&self.state, "biometrics.identify")
+            || !allowed(&self.state, "biometrics.identify")
         {
             return;
         }
@@ -195,11 +397,13 @@ impl DesktopApp {
         let bg_task = cx.background_spawn(async move {
             std::thread::sleep(Duration::from_millis(240));
             match signal {
-                ContinuousBiometricSignal::FingerMatch { pensioner_id } => {
-                    Ok(SimulatedBiometricGateway::simulate_match(&candidates, pensioner_id))
-                }
+                ContinuousBiometricSignal::FingerMatch { pensioner_id } => Ok(
+                    SimulatedBiometricGateway::simulate_match(&candidates, pensioner_id),
+                ),
                 ContinuousBiometricSignal::FingerUnrecognized => Ok(IdentificationOutcome::NoMatch),
-                ContinuousBiometricSignal::DeviceError(msg) => Err(BiometricError::DeviceError(msg)),
+                ContinuousBiometricSignal::DeviceError(msg) => {
+                    Err(BiometricError::DeviceError(msg))
+                }
             }
         });
 
@@ -215,7 +419,10 @@ impl DesktopApp {
 
                 match outcome {
                     Ok(IdentificationOutcome::Match { pensioner_id, .. }) => {
-                        if allowed(&app.state, "consumptions.create") && !app.biometric_modal_open {
+                        if app.biometric_modal_open {
+                            return;
+                        }
+                        if allowed(&app.state, "consumptions.create") {
                             app.biometric_modal_open = true;
                             app.biometric_gateway.set_modal_locked(true);
                             app.pending_auto_modal_pensioner = Some(pensioner_id);
@@ -256,7 +463,68 @@ impl DesktopApp {
                 self.push_biometric_event(wait_evt);
             }
         }
+        self.pending_global_search_clear = true;
         cx.notify();
+    }
+
+    /// Abre el modal de consumo desde búsqueda manual, respetando el bloqueo único de modales
+    /// y suspendiendo temporalmente nuevas identificaciones biométricas mientras esté abierto.
+    pub fn open_manual_consumption_modal(
+        &mut self,
+        pensioner_id: u32,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !allowed(&self.state, "consumptions.create") {
+            window.push_notification(
+                Notification::error("No tienes permiso para registrar consumos."),
+                cx,
+            );
+            return;
+        }
+        if self.biometric_modal_open || window.has_active_dialog(cx) {
+            window.push_notification(
+                Notification::warning("Cierra el diálogo actual antes de iniciar otra atención."),
+                cx,
+            );
+            self.pending_global_search_clear = true;
+            cx.notify();
+            return;
+        }
+        let active_name = match &self.state.data {
+            DataStatus::Ready(data) => data
+                .pensioners
+                .iter()
+                .find(|p| p.id == pensioner_id)
+                .map(|p| (p.active, p.name())),
+            _ => None,
+        };
+        let Some((active, name)) = active_name else {
+            window.push_notification(
+                Notification::error("No se encontró el pensionista seleccionado."),
+                cx,
+            );
+            self.pending_global_search_clear = true;
+            cx.notify();
+            return;
+        };
+        if !active {
+            window.push_notification(
+                Notification::warning(format!(
+                    "El pensionista {name} (#{pensioner_id}) está inactivo y no puede registrar consumos."
+                )),
+                cx,
+            );
+            self.pending_global_search_clear = true;
+            cx.notify();
+            return;
+        }
+
+        self.biometric_task = None;
+        self.biometric_op_id = self.biometric_op_id.wrapping_add(1);
+        self.biometric_modal_open = true;
+        self.biometric_gateway.set_modal_locked(true);
+        self.open_auto_consumption_modal(pensioner_id, window, cx);
     }
 
     pub fn biometric_connect(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -326,19 +594,25 @@ impl DesktopApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if window.has_active_dialog(cx) || !allowed(&self.state, "consumptions.create") {
+            window.push_notification(Notification::warning("No se puede iniciar la atención mientras exista otro diálogo o falten permisos."), cx);
+            self.resume_waiting_after_modal(cx);
+            return;
+        }
         let Some((person_name, bio_id, active, balance)) = (match &self.state.data {
-            DataStatus::Ready(data) => data
-                .pensioners
-                .iter()
-                .find(|p| p.id == pensioner_id)
-                .map(|p| {
-                    (
-                        p.name(),
-                        p.biometric_id.clone().unwrap_or_else(|| "—".into()),
-                        p.active,
-                        data.balance(p.id),
-                    )
-                }),
+            DataStatus::Ready(data) => {
+                data.pensioners
+                    .iter()
+                    .find(|p| p.id == pensioner_id)
+                    .map(|p| {
+                        (
+                            p.name(),
+                            p.biometric_id.clone().unwrap_or_else(|| "—".into()),
+                            p.active,
+                            data.balance(p.id),
+                        )
+                    })
+            }
             _ => None,
         }) else {
             self.resume_waiting_after_modal(cx);
@@ -357,13 +631,24 @@ impl DesktopApp {
         }
 
         let pricing = self.consumption_pricing;
+        let initial_meal = MealSchedule::default().current_meal();
+        let initial_meal_idx = match initial_meal {
+            Meal::Breakfast => 0,
+            Meal::Lunch => 1,
+        };
+        let meal_select = cx.new(|cx| {
+            SelectState::new(
+                vec!["Desayuno", "Almuerzo"],
+                Some(IndexPath::new(initial_meal_idx)),
+                window,
+                cx,
+            )
+        });
         let special_price_input = cx.new(|cx| {
             InputState::new(window, cx)
                 .placeholder("12.00")
                 .default_value(format_decimal(pricing.special_default_cents))
         });
-        let special_desc_input =
-            cx.new(|cx| InputState::new(window, cx).placeholder("Ej. Seco a la norteña"));
         let third_party_input =
             cx.new(|cx| InputState::new(window, cx).placeholder("Nombre de quien recoge"));
 
@@ -371,22 +656,38 @@ impl DesktopApp {
         self.consumption_confirm_token = self.consumption_confirm_token.wrapping_add(1);
 
         let modal_state = cx.new(|_| AutoModalState {
-            meal: Meal::Lunch,
+            meal: initial_meal,
             menu_kind: MenuKind::Economic,
             portions: 1,
             third_party: false,
-            draft: vec![DraftConsumptionItem {
-                id: 1,
-                meal: Meal::Lunch,
-                menu_kind: MenuKind::Economic,
-                description: "Ración económica".into(),
-                portions: 1,
-                unit_price_cents: pricing.economic_for(Meal::Lunch),
-            }],
-            next_id: 2,
+            cart: Vec::new(),
+            next_item_id: 1,
             error: None,
             submitting: false,
             token: initial_token,
+            _meal_subscription: None,
+        });
+
+        let modal_for_meal = modal_state.clone();
+        let meal_sub = cx.subscribe(
+            &meal_select,
+            move |_this, _select, event: &SelectEvent<Vec<&'static str>>, cx| {
+                if let SelectEvent::Confirm(Some(value)) = event {
+                    let selected_meal = if *value == "Desayuno" {
+                        Meal::Breakfast
+                    } else {
+                        Meal::Lunch
+                    };
+                    modal_for_meal.update(cx, |s, cx| {
+                        s.meal = selected_meal;
+                        s.error = None;
+                        cx.notify();
+                    });
+                }
+            },
+        );
+        modal_state.update(cx, |s, _| {
+            s._meal_subscription = Some(meal_sub);
         });
 
         let app_weak = cx.entity().downgrade();
@@ -394,18 +695,18 @@ impl DesktopApp {
 
         window.open_dialog(cx, move |dialog, _, cx| {
             let st = modal_state.read(cx);
-            let total_portions: u32 = st.draft.iter().map(|i| i.portions).sum();
-            let total_cents: i64 = st.draft.iter().map(|i| i.subtotal_cents()).sum();
             let meal = st.meal;
             let menu_kind = st.menu_kind;
             let portions = st.portions;
             let third_party = st.third_party;
             let error_msg = st.error.clone();
             let submitting = st.submitting;
-            let draft_items = st.draft.clone();
+            let econ_unit_cents = pricing.economic_for(meal);
+            let cart_items = st.cart.clone();
+            let total_portions: u32 = cart_items.iter().map(|i| i.portions).sum();
+            let total_cents: i64 = cart_items.iter().map(|i| i.subtotal_cents()).sum();
 
-            let modal_for_meal_b = modal_state.clone();
-            let modal_for_meal_l = modal_state.clone();
+            let meal_select_view = meal_select.clone();
             let modal_for_econ = modal_state.clone();
             let modal_for_spec = modal_state.clone();
             let modal_for_dec = modal_state.clone();
@@ -415,14 +716,13 @@ impl DesktopApp {
             let modal_for_submit = modal_state.clone();
 
             let sp_price_add = special_price_input.clone();
-            let sp_desc_add = special_desc_input.clone();
             let third_input_submit = third_party_input.clone();
             let app_submit = app_weak.clone();
             let app_cancel_btn = app_weak.clone();
             let app_close_cb = app_on_cancel.clone();
 
             dialog
-                .width(px(540.))
+                .width(px(560.))
                 .title(format!("Atención automática · {person_name}"))
                 .on_cancel(move |_, _, cx| {
                     let _ = app_close_cb.update(cx, |app, cx| {
@@ -469,7 +769,7 @@ impl DesktopApp {
                                             div()
                                                 .text_xs()
                                                 .text_color(cx.theme().muted_foreground)
-                                                .child("Estado: Activo · Huella verificada 1:N"),
+                                                .child("Estado: Activo · Atención de demostración"),
                                         ),
                                 )
                                 .child(
@@ -495,45 +795,23 @@ impl DesktopApp {
                         .child(
                             h_flex()
                                 .gap_2()
+                                .items_center()
                                 .flex_wrap()
                                 .child(
-                                    Button::new("auto-meal-breakfast")
-                                        .xsmall()
-                                        .when(meal == Meal::Breakfast, |b| b.primary())
-                                        .when(meal != Meal::Breakfast, |b| b.outline())
-                                        .label("Desayuno")
-                                        .on_click(move |_, _, cx| {
-                                            modal_for_meal_b.update(cx, |s, cx| {
-                                                s.meal = Meal::Breakfast;
-                                                cx.notify();
-                                            });
-                                        }),
-                                )
-                                .child(
-                                    Button::new("auto-meal-lunch")
-                                        .xsmall()
-                                        .when(meal == Meal::Lunch, |b| b.primary())
-                                        .when(meal != Meal::Lunch, |b| b.outline())
-                                        .label("Almuerzo")
-                                        .on_click(move |_, _, cx| {
-                                            modal_for_meal_l.update(cx, |s, cx| {
-                                                s.meal = Meal::Lunch;
-                                                cx.notify();
-                                            });
-                                        }),
+                                    div()
+                                        .w(px(140.))
+                                        .child(Select::new(&meal_select_view).xsmall()),
                                 )
                                 .child(
                                     Button::new("auto-menu-econ")
                                         .xsmall()
                                         .when(menu_kind == MenuKind::Economic, |b| b.primary())
                                         .when(menu_kind != MenuKind::Economic, |b| b.outline())
-                                        .label(format!(
-                                            "Económico ({})",
-                                            amount(pricing.economic_for(meal))
-                                        ))
+                                        .label(format!("Económico ({})", amount(econ_unit_cents)))
                                         .on_click(move |_, _, cx| {
                                             modal_for_econ.update(cx, |s, cx| {
                                                 s.menu_kind = MenuKind::Economic;
+                                                s.error = None;
                                                 cx.notify();
                                             });
                                         }),
@@ -547,35 +825,41 @@ impl DesktopApp {
                                         .on_click(move |_, _, cx| {
                                             modal_for_spec.update(cx, |s, cx| {
                                                 s.menu_kind = MenuKind::Special;
+                                                s.error = None;
                                                 cx.notify();
                                             });
                                         }),
                                 ),
                         )
-                        .when(menu_kind == MenuKind::Special, |this| {
-                            this.child(
-                                h_flex()
-                                    .gap_2()
-                                    .child(
-                                        div()
-                                            .w(px(120.))
-                                            .child(Input::new(&special_price_input)),
-                                    )
-                                    .child(
-                                        div()
-                                            .flex_1()
-                                            .child(Input::new(&special_desc_input)),
-                                    ),
-                            )
-                        })
                         .child(
                             h_flex()
                                 .justify_between()
                                 .gap_2()
+                                .p_2p5()
+                                .rounded(cx.theme().radius)
+                                .border_1()
+                                .border_color(cx.theme().border)
                                 .child(
                                     h_flex()
-                                        .gap_1p5()
-                                        .child(div().text_xs().child("Raciones:"))
+                                        .gap_2()
+                                        .when(menu_kind == MenuKind::Special, |this| {
+                                            this.child(
+                                                div()
+                                                    .w(px(110.))
+                                                    .child(Input::new(&special_price_input)),
+                                            )
+                                        })
+                                        .when(menu_kind == MenuKind::Economic, |this| {
+                                            this.child(
+                                                div()
+                                                    .text_xs()
+                                                    .text_color(cx.theme().muted_foreground)
+                                                    .child(format!(
+                                                        "Precio: {}",
+                                                        amount(econ_unit_cents)
+                                                    )),
+                                            )
+                                        })
                                         .child(
                                             Button::new("auto-dec")
                                                 .outline()
@@ -584,7 +868,8 @@ impl DesktopApp {
                                                 .label("-")
                                                 .on_click(move |_, _, cx| {
                                                     modal_for_dec.update(cx, |s, cx| {
-                                                        s.portions = s.portions.saturating_sub(1).max(1);
+                                                        s.portions =
+                                                            s.portions.saturating_sub(1).max(1);
                                                         cx.notify();
                                                     });
                                                 }),
@@ -611,54 +896,47 @@ impl DesktopApp {
                                         ),
                                 )
                                 .child(
-                                    Button::new("auto-add-line")
+                                    Button::new("auto-add-cart")
                                         .outline()
                                         .xsmall()
                                         .icon(LucideIcon::Plus)
-                                        .label("Agregar ración")
+                                        .label(if menu_kind == MenuKind::Economic {
+                                            "Agregar económico"
+                                        } else {
+                                            "Agregar especial"
+                                        })
                                         .on_click(move |_, _, cx| {
                                             let raw_price = sp_price_add.read(cx).value().to_string();
-                                            let raw_desc = sp_desc_add.read(cx).value().trim().to_string();
                                             modal_for_add.update(cx, |s, cx| {
                                                 let unit_cents = match s.menu_kind {
-                                                    MenuKind::Economic => pricing.economic_for(s.meal),
-                                                    MenuKind::Special => match parse_price_cents(&raw_price) {
-                                                        Ok(c) => c,
-                                                        Err(err) => {
-                                                            s.error = Some(err);
-                                                            cx.notify();
-                                                            return;
-                                                        }
-                                                    },
-                                                };
-                                                let desc = if s.menu_kind == MenuKind::Special {
-                                                    if raw_desc.is_empty() {
-                                                        "Plato especial".to_string()
-                                                    } else {
-                                                        raw_desc
+                                                    MenuKind::Economic => {
+                                                        pricing.economic_for(s.meal)
                                                     }
-                                                } else {
-                                                    "Ración económica".to_string()
+                                                    MenuKind::Special => {
+                                                        match parse_price_cents(&raw_price) {
+                                                            Ok(c) => c,
+                                                            Err(err) => {
+                                                                s.error = Some(err);
+                                                                cx.notify();
+                                                                return;
+                                                            }
+                                                        }
+                                                    }
                                                 };
-                                                if let Some(ex) = s.draft.iter_mut().find(|i| {
-                                                    i.meal == s.meal
-                                                        && i.menu_kind == s.menu_kind
-                                                        && i.unit_price_cents == unit_cents
-                                                        && i.description == desc
-                                                }) {
-                                                    ex.portions += s.portions;
-                                                } else {
-                                                    let id = s.next_id;
-                                                    s.next_id += 1;
-                                                    s.draft.push(DraftConsumptionItem {
-                                                        id,
-                                                        meal: s.meal,
-                                                        menu_kind: s.menu_kind,
-                                                        description: desc,
-                                                        portions: s.portions,
-                                                        unit_price_cents: unit_cents,
-                                                    });
+                                                let mut next_id = s.next_item_id;
+                                                if let Err(err) = add_to_mixed_cart(
+                                                    &mut s.cart,
+                                                    &mut next_id,
+                                                    s.meal,
+                                                    s.menu_kind,
+                                                    s.portions,
+                                                    unit_cents,
+                                                ) {
+                                                    s.error = Some(err);
+                                                    cx.notify();
+                                                    return;
                                                 }
+                                                s.next_item_id = next_id;
                                                 s.portions = 1;
                                                 s.error = None;
                                                 cx.notify();
@@ -666,50 +944,122 @@ impl DesktopApp {
                                         }),
                                 ),
                         )
-                        .child(
-                            v_flex().gap_1p5().children(draft_items.into_iter().map(|item| {
-                                let item_id = item.id;
-                                let modal_rm = modal_state.clone();
-                                h_flex()
-                                    .justify_between()
-                                    .px_2p5()
-                                    .py_1p5()
-                                    .rounded(cx.theme().radius)
-                                    .border_1()
-                                    .border_color(cx.theme().border)
-                                    .child(
-                                        div().text_xs().child(format!(
-                                            "{} · {} ({}) × {}",
-                                            item.meal.label(),
-                                            item.description,
-                                            item.menu_kind.label(),
-                                            item.portions
-                                        )),
-                                    )
-                                    .child(
-                                        h_flex()
-                                            .gap_1p5()
-                                            .child(
-                                                div()
-                                                    .text_xs()
-                                                    .font_weight(FontWeight::SEMIBOLD)
-                                                    .child(amount(item.subtotal_cents())),
-                                            )
-                                            .child(
-                                                Button::new(format!("auto-rm-{item_id}"))
-                                                    .ghost()
-                                                    .xsmall()
-                                                    .icon(LucideIcon::X)
-                                                    .on_click(move |_, _, cx| {
-                                                        modal_rm.update(cx, |s, cx| {
-                                                            s.draft.retain(|i| i.id != item_id);
-                                                            cx.notify();
-                                                        });
-                                                    }),
-                                            ),
-                                    )
-                            })),
-                        )
+                        .child(if cart_items.is_empty() {
+                            div()
+                                .p_3()
+                                .rounded(cx.theme().radius)
+                                .border_1()
+                                .border_color(cx.theme().border)
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .child("Carrito vacío. Agrega consumos económicos o especiales para esta atención.")
+                                .into_any_element()
+                        } else {
+                            v_flex()
+                                .gap_1p5()
+                                .children(cart_items.into_iter().map(|item| {
+                                    let item_id = item.id;
+                                    let modal_dec = modal_state.clone();
+                                    let modal_inc = modal_state.clone();
+                                    let modal_rm = modal_state.clone();
+                                    h_flex()
+                                        .justify_between()
+                                        .px_2p5()
+                                        .py_1p5()
+                                        .rounded(cx.theme().radius)
+                                        .border_1()
+                                        .border_color(cx.theme().border)
+                                        .child(
+                                            h_flex()
+                                                .gap_1p5()
+                                                .child(
+                                                    div().text_xs().font_weight(FontWeight::MEDIUM).child(
+                                                        format!(
+                                                            "{} · {} ({})",
+                                                            item.meal.label(),
+                                                            item.menu_kind.label(),
+                                                            amount(item.unit_price_cents)
+                                                        ),
+                                                    ),
+                                                ),
+                                        )
+                                        .child(
+                                            h_flex()
+                                                .gap_1p5()
+                                                .child(
+                                                    Button::new(format!("cart-dec-{item_id}"))
+                                                        .ghost()
+                                                        .xsmall()
+                                                        .label("-")
+                                                        .on_click(move |_, _, cx| {
+                                                            modal_dec.update(cx, |s, cx| {
+                                                                if let Some(pos) = s
+                                                                    .cart
+                                                                    .iter()
+                                                                    .position(|i| i.id == item_id)
+                                                                {
+                                                                    if s.cart[pos].portions <= 1 {
+                                                                        s.cart.remove(pos);
+                                                                    } else {
+                                                                        s.cart[pos].portions -= 1;
+                                                                    }
+                                                                }
+                                                                cx.notify();
+                                                            });
+                                                        }),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .w(px(20.))
+                                                        .text_center()
+                                                        .text_xs()
+                                                        .font_weight(FontWeight::BOLD)
+                                                        .child(item.portions.to_string()),
+                                                )
+                                                .child(
+                                                    Button::new(format!("cart-inc-{item_id}"))
+                                                        .ghost()
+                                                        .xsmall()
+                                                        .label("+")
+                                                        .on_click(move |_, _, cx| {
+                                                            modal_inc.update(cx, |s, cx| {
+                                                                if let Some(i) = s
+                                                                    .cart
+                                                                    .iter_mut()
+                                                                    .find(|i| i.id == item_id)
+                                                                {
+                                                                    i.portions =
+                                                                        i.portions.saturating_add(1);
+                                                                }
+                                                                cx.notify();
+                                                            });
+                                                        }),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .w(px(72.))
+                                                        .text_right()
+                                                        .text_xs()
+                                                        .font_weight(FontWeight::SEMIBOLD)
+                                                        .child(amount(item.subtotal_cents())),
+                                                )
+                                                .child(
+                                                    Button::new(format!("cart-rm-{item_id}"))
+                                                        .ghost()
+                                                        .xsmall()
+                                                        .icon(LucideIcon::X)
+                                                        .tooltip("Eliminar")
+                                                        .on_click(move |_, _, cx| {
+                                                            modal_rm.update(cx, |s, cx| {
+                                                                s.cart.retain(|i| i.id != item_id);
+                                                                cx.notify();
+                                                            });
+                                                        }),
+                                                ),
+                                        )
+                                }))
+                                .into_any_element()
+                        })
                         .child(
                             h_flex()
                                 .justify_between()
@@ -766,40 +1116,49 @@ impl DesktopApp {
                         .child(
                             Button::new("auto-modal-confirm")
                                 .primary()
-                                .disabled(submitting)
-                                .label("Confirmar consumo")
+                                .disabled(submitting || total_portions == 0)
+                                .label("Confirmar atención")
                                 .on_click(move |_, window, cx| {
-                                    let pickup_name = third_input_submit.read(cx).value().trim().to_string();
-                                    let state_snap = modal_for_submit.read(cx);
-                                    if state_snap.submitting {
+                                    let pickup_name =
+                                        third_input_submit.read(cx).value().trim().to_string();
+                                    let (already_submitting, items, is_third, token) = {
+                                        let s = modal_for_submit.read(cx);
+                                        (s.submitting, s.cart.clone(), s.third_party, s.token)
+                                    };
+                                    if already_submitting {
                                         return;
                                     }
-                                    if state_snap.draft.is_empty() {
+                                    if items.is_empty() {
                                         modal_for_submit.update(cx, |s, cx| {
-                                            s.error = Some("Agrega al menos una ración.".into());
+                                            s.error =
+                                                Some("Agrega al menos un consumo al carrito.".into());
                                             cx.notify();
                                         });
                                         return;
                                     }
-                                    if state_snap.third_party && pickup_name.chars().count() < 2 {
+                                    if is_third && pickup_name.chars().count() < 2 {
                                         modal_for_submit.update(cx, |s, cx| {
-                                            s.error = Some("Ingresa el nombre de quien recoge.".into());
+                                            s.error =
+                                                Some("Ingresa el nombre de quien recoge.".into());
                                             cx.notify();
                                         });
                                         return;
                                     }
-                                    let items = state_snap.draft.clone();
-                                    let token = state_snap.token;
-                                    let pickup = state_snap.third_party.then_some(pickup_name);
+                                    let pickup = is_third.then_some(pickup_name);
 
                                     modal_for_submit.update(cx, |s, _| s.submitting = true);
 
                                     let res = app_submit.update(cx, |app, cx| {
-                                        let date = app.state.dashboard_date;
+                                        if !allowed(&app.state, "consumptions.create") {
+                                            return Err("No tienes permiso para registrar consumos.".to_string());
+                                        }
+                                        let now = chrono::Local::now();
+                                        let date = now.date_naive();
+                                        let time = now.format("%H:%M").to_string();
                                         let out = match &mut app.state.data {
                                             DataStatus::Ready(data) => data.record_consumptions(
                                                 date,
-                                                "13:20",
+                                                &time,
                                                 pensioner_id,
                                                 &items,
                                                 pickup.as_deref(),
@@ -853,7 +1212,6 @@ pub fn render(
     let is_connected = reader_state.is_connected();
     let is_identifying = matches!(reader_state, BiometricReaderState::Identifying);
     let can_identify = allowed(state, "biometrics.identify");
-
     let (ring_color, icon_color) = match reader_state {
         BiometricReaderState::Disconnected => (theme.border, theme.muted_foreground),
         BiometricReaderState::Connected => (theme.info, theme.info),
@@ -1042,16 +1400,7 @@ pub fn render(
                                                     })),
                                             )
                                         })
-                                        .child(
-                                            Button::new("bio-manual-search")
-                                                .outline()
-                                                .small()
-                                                .icon(LucideIcon::Search)
-                                                .label("Búsqueda manual")
-                                                .on_click(cx.listener(|this, _, _, cx| {
-                                                    this.navigate_to(Page::Consumos, cx);
-                                                })),
-                                        ),
+                                        ,
                                 ),
                         ),
                 )
@@ -1101,7 +1450,7 @@ pub fn render(
                                                         .icon(LucideIcon::Utensils)
                                                         .label("Abrir modal de consumo")
                                                         .on_click(cx.listener(move |this, _, window, cx| {
-                                                            this.open_auto_consumption_modal(pid, window, cx);
+                                                            this.open_manual_consumption_modal(pid, window, cx);
                                                         })),
                                                 )
                                                 .child(
@@ -1150,4 +1499,130 @@ pub fn render(
                         ),
                 ),
         )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn schedule_selects_breakfast_or_lunch_by_hour() {
+        let schedule = MealSchedule::default();
+        assert_eq!(schedule.meal_for_hour(8), Meal::Breakfast);
+        assert_eq!(schedule.meal_for_hour(10), Meal::Breakfast);
+        assert_eq!(schedule.meal_for_hour(11), Meal::Lunch);
+        assert_eq!(schedule.meal_for_hour(14), Meal::Lunch);
+    }
+
+    #[test]
+    fn mixed_cart_groups_same_type_and_price_and_separates_different_specials() {
+        let mut cart = Vec::new();
+        let mut next_id = 1;
+
+        // 2 almuerzos económicos + 1 almuerzo económico -> agrupa en 3
+        add_to_mixed_cart(
+            &mut cart,
+            &mut next_id,
+            Meal::Lunch,
+            MenuKind::Economic,
+            2,
+            700,
+        )
+        .unwrap();
+        add_to_mixed_cart(
+            &mut cart,
+            &mut next_id,
+            Meal::Lunch,
+            MenuKind::Economic,
+            1,
+            700,
+        )
+        .unwrap();
+
+        // Especial S/ 12 + Especial S/ 15 -> quedan separados; otro Especial S/ 12 -> agrupa
+        add_to_mixed_cart(
+            &mut cart,
+            &mut next_id,
+            Meal::Lunch,
+            MenuKind::Special,
+            1,
+            1200,
+        )
+        .unwrap();
+        add_to_mixed_cart(
+            &mut cart,
+            &mut next_id,
+            Meal::Lunch,
+            MenuKind::Special,
+            1,
+            1500,
+        )
+        .unwrap();
+        add_to_mixed_cart(
+            &mut cart,
+            &mut next_id,
+            Meal::Lunch,
+            MenuKind::Special,
+            2,
+            1200,
+        )
+        .unwrap();
+
+        assert_eq!(cart.len(), 3);
+        assert_eq!(cart[0].portions, 3);
+        assert_eq!(cart[0].subtotal_cents(), 2100);
+        assert_eq!(cart[1].portions, 3);
+        assert_eq!(cart[1].unit_price_cents, 1200);
+        assert_eq!(cart[2].portions, 1);
+        assert_eq!(cart[2].unit_price_cents, 1500);
+
+        let total: i64 = cart.iter().map(|i| i.subtotal_cents()).sum();
+        assert_eq!(total, 2100 + 3600 + 1500);
+
+        assert!(add_to_mixed_cart(
+            &mut cart,
+            &mut next_id,
+            Meal::Lunch,
+            MenuKind::Special,
+            0,
+            1200
+        )
+        .is_err());
+        assert!(add_to_mixed_cart(
+            &mut cart,
+            &mut next_id,
+            Meal::Lunch,
+            MenuKind::Special,
+            1,
+            0
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn global_combobox_choices_exclude_inactive_and_match_normalized_fields() {
+        let mut data = MockData::demo(chrono::Local::now().date_naive());
+        let active_id = data
+            .save_pensioner(None, "Lucía", "Gómez Ávila", "955123456")
+            .unwrap();
+        let inactive_id = data
+            .save_pensioner(None, "Pedro", "Inactivo", "944000111")
+            .unwrap();
+        data.pensioners
+            .iter_mut()
+            .find(|p| p.id == inactive_id)
+            .unwrap()
+            .active = false;
+
+        let choices = build_global_pensioner_choices(&data);
+        assert!(choices.iter().any(|c| c.id == active_id));
+        assert!(!choices.iter().any(|c| c.id == inactive_id));
+
+        let item = choices.iter().find(|c| c.id == active_id).unwrap();
+        assert!(item.matches("lucia avila"));
+        assert!(item.matches(&format!("#{active_id}")));
+        assert!(item.matches("955123"));
+        assert!(!item.matches("inexistente"));
+        assert!(item.matches("luci\u{301}a go\u{301}mez"));
+    }
 }

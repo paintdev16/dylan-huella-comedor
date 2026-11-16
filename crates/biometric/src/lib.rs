@@ -111,6 +111,8 @@ pub enum BiometricEvent {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BiometricError {
     ReaderDisconnected,
+    MatcherUnavailable,
+    AlreadyEnrolled { owner_id: u32 },
     DuplicateBiometricId {
         biometric_id: String,
         owner_id: u32,
@@ -125,6 +127,8 @@ impl fmt::Display for BiometricError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::ReaderDisconnected => write!(f, "El lector biométrico está desconectado."),
+            Self::MatcherUnavailable => write!(f, "La verificación biométrica 1:N real no está disponible."),
+            Self::AlreadyEnrolled { owner_id } => write!(f, "El pensionista #{owner_id} ya tiene una huella registrada."),
             Self::DuplicateBiometricId {
                 biometric_id,
                 owner_id,
@@ -162,6 +166,21 @@ pub enum IdentificationOutcome {
         biometric_id: String,
     },
     NoMatch,
+}
+
+/// Contrato para la búsqueda real 1:N sobre plantillas, no sobre códigos.
+/// Un adaptador SecuSearch debe consultar todas las plantillas registradas,
+/// incluidas las de pensionistas inactivos, y rechazar el enrolamiento ante error.
+pub trait FingerprintMatcher: Send + Sync {
+    fn find_match(&self, probe_template: &[u8]) -> Result<Option<u32>, BiometricError>;
+}
+
+/// Hasta integrar el SDK no se puede certificar que una huella sea única.
+pub struct UnavailableFingerprintMatcher;
+impl FingerprintMatcher for UnavailableFingerprintMatcher {
+    fn find_match(&self, _probe_template: &[u8]) -> Result<Option<u32>, BiometricError> {
+        Err(BiometricError::MatcherUnavailable)
+    }
 }
 
 /// Contrato desacoplado de GPUI y Axum para integrar SecuGen FDx SDK Pro y SecuSearch Pro.
@@ -381,6 +400,10 @@ impl BiometricGateway for SimulatedBiometricGateway {
             ));
         }
 
+        if existing.iter().any(|c| c.pensioner_id == pensioner_id) {
+            return Err(BiometricError::AlreadyEnrolled { owner_id: pensioner_id });
+        }
+
         if let Some(conflict) = existing
             .iter()
             .find(|c| c.pensioner_id != pensioner_id && c.biometric_id.eq_ignore_ascii_case(clean))
@@ -456,6 +479,12 @@ mod tests {
 
         let tpl = gw.validate_enrollment(2, "BIO-0002", &existing).unwrap();
         assert_eq!(tpl.biometric_id, "BIO-0002");
+        assert_eq!(gw.validate_enrollment(1, "BIO-0003", &existing).unwrap_err(), BiometricError::AlreadyEnrolled { owner_id: 1 });
+    }
+
+    #[test]
+    fn unavailable_real_matcher_does_not_claim_a_unique_fingerprint() {
+        assert_eq!(UnavailableFingerprintMatcher.find_match(b"template"), Err(BiometricError::MatcherUnavailable));
     }
 
     #[test]

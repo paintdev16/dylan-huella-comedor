@@ -112,6 +112,10 @@ impl DesktopApp {
             );
             return;
         }
+        if self.biometric_modal_open || window.has_active_dialog(cx) {
+            window.push_notification(Notification::warning("Ya hay una operación en curso."), cx);
+            return;
+        }
         let person = match (&self.state.data, id) {
             (DataStatus::Ready(data), Some(id)) => {
                 data.pensioners.iter().find(|p| p.id == id).cloned()
@@ -359,10 +363,10 @@ impl DesktopApp {
                                                             Button::new("new-enroll-sim-capture")
                                                                 .outline()
                                                                 .xsmall()
-                                                                .disabled(!enr.consent_given || is_busy)
+                                                                .disabled(!enr.consent_given || is_busy || matches!(enr.step, EnrollmentStep::Registered { .. }))
                                                                 .icon(LucideIcon::FingerprintPattern)
                                                                 .label(match &enr.step {
-                                                                    EnrollmentStep::Registered { .. } => "Recapturar",
+                                                                    EnrollmentStep::Registered { .. } => "Captura simulada completada",
                                                                     EnrollmentStep::Error(_) => "Reintentar",
                                                                     _ => "Simular captura",
                                                                 })
@@ -434,7 +438,7 @@ impl DesktopApp {
                                             div()
                                                 .text_xs()
                                                 .text_color(cx.theme().muted_foreground)
-                                                .child("Simulación por eventos sin lector físico; no registra huella real."),
+                                                .child("Simulación: solo verifica códigos, no compara ni registra huellas reales."),
                                         )
                                     })
                                     .when(!enr.enabled, |this| {
@@ -510,21 +514,28 @@ impl DesktopApp {
                                                 "No tienes permiso para guardar.".to_string()
                                             );
                                         }
+                                        if captured_bio.is_some() && !this.has_pensioner_permission("biometrics.enroll") {
+                                            return Err("No tienes permiso para registrar huellas.".to_string());
+                                        }
                                         let DataStatus::Ready(data) = &mut this.state.data else {
                                             return Err(
                                                 "Los datos no están disponibles.".to_string()
                                             );
                                         };
-                                        let saved_id =
-                                            data.save_pensioner(id, &first, &last, &phone)?;
+                                        // Commit all changes together; a duplicate leaves no partial person behind.
+                                        let mut draft = data.clone();
+                                        let saved_id = draft.save_pensioner(id, &first, &last, &phone)?;
                                         if let Some(bio_code) = &captured_bio {
+                                            this.biometric_gateway.validate_enrollment(saved_id, bio_code, &data.biometric_candidates())
+                                                .map_err(|err| err.to_string())?;
                                             let registered =
-                                                data.register_fingerprint_with_id(saved_id, bio_code)?;
+                                                draft.register_fingerprint_with_id(saved_id, bio_code)?;
+                                            *data = draft;
                                             this.push_biometric_event(BiometricEvent::Enrolled {
                                                 pensioner_id: saved_id,
                                                 biometric_id: registered,
                                             });
-                                        }
+                                        } else { *data = draft; }
                                         this.selected_pensioner = Some(saved_id);
                                         if is_new {
                                             this.resume_waiting_after_modal(cx);
@@ -587,6 +598,14 @@ impl DesktopApp {
             window.push_notification(Notification::error("Pensionista no encontrado."), cx);
             return;
         };
+        if person.fingerprint_registered || person.biometric_id.is_some() {
+            window.push_notification(Notification::warning("Este pensionista ya tiene una huella registrada"), cx);
+            return;
+        }
+        if self.biometric_modal_open || window.has_active_dialog(cx) {
+            window.push_notification(Notification::warning("Ya hay un enrolamiento o diálogo en curso."), cx);
+            return;
+        }
         if !person.active {
             window.push_notification(
                 Notification::error("Activa al pensionista antes de gestionar su huella."),
@@ -729,7 +748,7 @@ impl DesktopApp {
                                                 .child(if let Some(bio) = &captured_id {
                                                     format!("Identificador único generado: {bio} (simulación sin lector real).")
                                                 } else {
-                                                    "Identificación de consumos suspendida mientras este modal permanezca abierto.".to_string()
+                                                    "Simulación: solo verifica códigos, no compara huellas reales.".to_string()
                                                 }),
                                         ),
                                 ),
@@ -741,13 +760,9 @@ impl DesktopApp {
                                     Button::new("modal-enroll-capture")
                                         .outline()
                                         .small()
-                                        .disabled(!reader_connected || is_busy)
+                                        .disabled(!reader_connected || is_busy || captured_id.is_some())
                                         .icon(LucideIcon::FingerprintPattern)
-                                        .label(if already_registered {
-                                            "Recapturar huella"
-                                        } else {
-                                            "Simular captura"
-                                        })
+                                        .label(if captured_id.is_some() { "Captura simulada completada" } else { "Simular captura" })
                                         .on_click(move |_, _, cx| {
                                             let seq = modal_cap.update(cx, |s, cx| {
                                                 s.op_seq = s.op_seq.wrapping_add(1);
@@ -849,11 +864,16 @@ impl DesktopApp {
                                         _ => return,
                                     };
                                     let res = app_save_cb.update(cx, |this, cx| {
+                                        if !this.has_pensioner_permission("biometrics.enroll") {
+                                            return Err("No tienes permiso para registrar huellas.".to_string());
+                                        }
                                         let DataStatus::Ready(data) = &mut this.state.data else {
                                             return Err(
                                                 "Los datos no están disponibles.".to_string(),
                                             );
                                         };
+                                        this.biometric_gateway.validate_enrollment(id, &bio_code, &data.biometric_candidates())
+                                            .map_err(|err| err.to_string())?;
                                         let registered =
                                             data.register_fingerprint_with_id(id, &bio_code)?;
                                         this.push_biometric_event(BiometricEvent::Enrolled {
@@ -1193,6 +1213,7 @@ pub fn render(
     search: &Entity<InputState>,
     filter: Filter,
     selected: Option<u32>,
+    enrollment_busy: bool,
 ) -> impl IntoElement {
     let theme = app.theme();
     let data = match &state.data {
@@ -1303,18 +1324,21 @@ pub fn render(
                             )
                         })
                         .when(allowed(state, "biometrics.enroll"), |this| {
-                            let has_fp = person.fingerprint_registered;
+                            let has_fp = person.fingerprint_registered || person.biometric_id.is_some();
                             let is_active = person.active;
                             this.child(
                                 Button::new(format!("person-bio-{id}"))
                                     .ghost()
                                     .small()
-                                    .disabled(!is_active)
+                                    .disabled(!is_active || has_fp || enrollment_busy)
                                     .icon(LucideIcon::FingerprintPattern)
-                                    .tooltip(if !is_active {
+                                    .accessibility_label("Registrar huella")
+                                    .tooltip(if has_fp {
+                                        "Este pensionista ya tiene una huella registrada"
+                                    } else if enrollment_busy {
+                                        "Hay un enrolamiento en curso"
+                                    } else if !is_active {
                                         "Activa al pensionista para gestionar su huella"
-                                    } else if has_fp {
-                                        "Gestionar huella"
                                     } else {
                                         "Registrar huella"
                                     })

@@ -27,7 +27,7 @@ fn table(summary: &DashboardSummary, cx: &App) -> impl IntoElement {
     let mut rows = v_flex().w_full();
     for row in summary.activity.iter().take(10) {
         rows = rows.child(h_flex().w_full().gap_4().px_4().py_3().border_t_1().border_color(theme.border)
-            .child(cell(row.time, 64.))
+            .child(cell(row.time.clone(), 64.))
             .child(cell(row.person.clone(), 180.))
             .child(cell(row.kind, 130.))
             .child(cell(row.portions.map(|n| n.to_string()).unwrap_or_else(|| "—".into()), 80.))

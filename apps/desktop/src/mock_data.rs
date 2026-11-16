@@ -142,7 +142,7 @@ pub fn parse_price_cents(raw: &str) -> Result<i64, String> {
 #[derive(Clone, Debug)]
 pub struct Consumption {
     pub date: NaiveDate,
-    pub time: &'static str,
+    pub time: String,
     pub pensioner_id: u32,
     pub meal: Meal,
     pub portions: u32,
@@ -253,7 +253,7 @@ pub struct MockData {
 
 #[derive(Clone, Debug)]
 pub struct Activity {
-    pub time: &'static str,
+    pub time: String,
     pub person: String,
     pub kind: &'static str,
     pub portions: Option<u32>,
@@ -657,6 +657,12 @@ impl MockData {
         if clean_bio.is_empty() {
             return Err("Ingresa un identificador biométrico válido.".into());
         }
+        let person = self.pensioners.iter().find(|p| p.id == id)
+            .ok_or_else(|| "Pensionista no encontrado.".to_string())?;
+        if !person.active { return Err("El pensionista está inactivo.".into()); }
+        if person.fingerprint_registered || person.biometric_id.is_some() {
+            return Err("Este pensionista ya tiene una huella registrada.".into());
+        }
         if let Some(other) = self.pensioners.iter().find(|p| {
             p.id != id
                 && p.biometric_id
@@ -674,9 +680,6 @@ impl MockData {
             .iter_mut()
             .find(|p| p.id == id)
             .ok_or_else(|| "Pensionista no encontrado.".to_string())?;
-        if !person.active {
-            return Err("El pensionista está inactivo.".into());
-        }
         person.fingerprint_registered = true;
         person.biometric_id = Some(clean_bio.to_string());
         Ok(clean_bio.to_string())
@@ -704,7 +707,7 @@ impl MockData {
     pub fn record_consumptions(
         &mut self,
         date: NaiveDate,
-        time: &'static str,
+        time: &str,
         pensioner_id: u32,
         items: &[DraftConsumptionItem],
         picked_up_by: Option<&str>,
@@ -749,7 +752,7 @@ impl MockData {
         for item in items {
             self.consumptions.push(Consumption {
                 date,
-                time,
+                time: time.to_string(),
                 pensioner_id,
                 meal: item.meal,
                 portions: item.portions,
@@ -833,7 +836,7 @@ impl MockData {
             consumptions: vec![
                 Consumption {
                     date: today,
-                    time: "08:10",
+                    time: "08:10".into(),
                     pensioner_id: 1,
                     meal: Meal::Breakfast,
                     portions: 1,
@@ -844,7 +847,7 @@ impl MockData {
                 },
                 Consumption {
                     date: today,
-                    time: "08:25",
+                    time: "08:25".into(),
                     pensioner_id: 2,
                     meal: Meal::Breakfast,
                     portions: 2,
@@ -855,7 +858,7 @@ impl MockData {
                 },
                 Consumption {
                     date: today,
-                    time: "12:15",
+                    time: "12:15".into(),
                     pensioner_id: 1,
                     meal: Meal::Lunch,
                     portions: 1,
@@ -866,7 +869,7 @@ impl MockData {
                 },
                 Consumption {
                     date: today,
-                    time: "12:40",
+                    time: "12:40".into(),
                     pensioner_id: 3,
                     meal: Meal::Lunch,
                     portions: 2,
@@ -877,7 +880,7 @@ impl MockData {
                 },
                 Consumption {
                     date: yesterday,
-                    time: "12:10",
+                    time: "12:10".into(),
                     pensioner_id: 2,
                     meal: Meal::Lunch,
                     portions: 1,
@@ -964,7 +967,7 @@ impl MockData {
                 result.portions += c.portions;
                 result.consumed_cents += c.cents;
                 result.activity.push(Activity {
-                    time: c.time,
+                    time: c.time.clone(),
                     person: names
                         .get(&c.pensioner_id)
                         .cloned()
@@ -982,7 +985,7 @@ impl MockData {
             if p.date == date {
                 result.paid_cents += p.cents;
                 result.activity.push(Activity {
-                    time: p.time,
+                    time: p.time.to_string(),
                     person: names
                         .get(&p.pensioner_id)
                         .cloned()
@@ -994,7 +997,7 @@ impl MockData {
             }
         }
         result.debt_cents = balances.values().map(|v| (*v).max(0)).sum();
-        result.activity.sort_by(|a, b| b.time.cmp(a.time));
+        result.activity.sort_by(|a, b| b.time.cmp(&a.time));
         result
     }
 }
@@ -1098,6 +1101,11 @@ mod tests {
         assert!(data.register_fingerprint_with_id(2, "BIO-0001").is_err());
         assert!(data.register_fingerprint_with_id(2, "BIO-0002").is_ok());
         assert_eq!(data.pensioners[1].biometric_id.as_deref(), Some("BIO-0002"));
+        assert!(data.register_fingerprint_with_id(2, "BIO-0003").is_err());
+        assert!(data.register_fingerprint_with_id(2, "BIO-0002").is_err());
+        assert!(data.register_fingerprint_with_id(3, "bio-0002").is_err());
+        assert_eq!(data.pensioners[1].biometric_id.as_deref(), Some("BIO-0002"));
+        assert!(!data.pensioners[2].fingerprint_registered);
     }
     #[test]
     fn consumptions_support_multiple_items_third_party_and_prevent_duplicates() {
@@ -1138,10 +1146,11 @@ mod tests {
             data.record_consumptions(date, "13:00", 4, &items, None, 10, &mut processed)
                 .is_err()
         );
+        let time = String::from("13:37");
         assert_eq!(
             data.record_consumptions(
                 date,
-                "13:00",
+                &time,
                 1,
                 &items,
                 Some("Pedro Torres"),
@@ -1151,6 +1160,8 @@ mod tests {
             .unwrap(),
             2
         );
+        drop(time);
+        assert_eq!(data.consumptions.last().unwrap().time, "13:37");
         assert!(
             data.record_consumptions(
                 date,
