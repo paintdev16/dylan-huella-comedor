@@ -5,6 +5,7 @@ edition.workspace = true
 
 [dependencies]
 anyhow = "1"
+biometric = { path = "../../crates/biometric" }
 gpui-kit = "=0.9.1"
 thiserror = "2"
 serde = { version = "1", features = ["derive"] }

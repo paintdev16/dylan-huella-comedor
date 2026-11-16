@@ -117,6 +117,7 @@ impl DesktopApp {
         });
         let form_error: Entity<Option<String>> = cx.new(|_| None);
         let app = cx.entity().downgrade();
+        let app_for_enroll_root = app.clone();
         window.open_dialog(cx, move |dialog, _, cx| {
             let first_field = first.clone();
             let last_field = last.clone();
@@ -124,6 +125,7 @@ impl DesktopApp {
             let form_error_view = form_error.clone();
             let form_error_submit = form_error.clone();
             let app = app.clone();
+            let app_for_enroll = app_for_enroll_root.clone();
             let current_error = form_error_view.read(cx).clone();
 
             dialog
@@ -217,19 +219,29 @@ impl DesktopApp {
                                                 "Los datos no están disponibles.".to_string()
                                             );
                                         };
-                                        let id = data.save_pensioner(id, &first, &last, &phone)?;
-                                        this.selected_pensioner = Some(id);
+                                        let saved_id =
+                                            data.save_pensioner(id, &first, &last, &phone)?;
+                                        this.selected_pensioner = Some(saved_id);
+                                        let should_enroll = id.is_none()
+                                            && this.has_pensioner_permission("biometrics.enroll");
                                         cx.notify();
-                                        Ok(())
+                                        Ok((saved_id, should_enroll))
                                     });
                                     match result {
-                                        Ok(Ok(())) => {
+                                        Ok(Ok((saved_id, should_enroll))) => {
                                             form_error_submit.update(cx, |err, _| *err = None);
                                             window.close_dialog(cx);
                                             window.push_notification(
                                                 Notification::success("Pensionista guardado."),
                                                 cx,
                                             );
+                                            if should_enroll {
+                                                let _ = app_for_enroll.update(cx, |this, cx| {
+                                                    this.confirm_change(
+                                                        saved_id, true, window, cx,
+                                                    );
+                                                });
+                                            }
                                         }
                                         Ok(Err(error)) => {
                                             form_error_submit.update(cx, |err, cx| {

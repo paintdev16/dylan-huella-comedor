@@ -9,7 +9,10 @@ use gpui_kit::{
         input::{InputEvent, InputState},
         scroll::ScrollableElement as _,
         sidebar::SidebarToggleButton,
+        tag::Tag,
         v_flex,
+        WindowExt as _,
+        notification::Notification,
     },
     px,
     prelude::FluentBuilder as _,
@@ -62,6 +65,11 @@ pub struct DesktopApp {
     pub(crate) biometric_event_log: Vec<SharedString>,
     pub(crate) biometric_task: Option<Task<()>>,
     pub(crate) biometric_op_id: u64,
+    pub(crate) biometric_signal_tx: Option<std::sync::mpsc::Sender<crate::biometric_service::ContinuousBiometricSignal>>,
+    pub(crate) biometric_listener_task: Option<Task<()>>,
+    pub(crate) biometric_modal_open: bool,
+    pub(crate) pending_auto_modal_pensioner: Option<u32>,
+    pub(crate) pending_biometric_notice: Option<(bool, SharedString)>,
     pub(crate) pending_consumption_pensioner: Option<u32>,
     pub(crate) consumption_search: Entity<InputState>,
     pub(crate) consumption_special_price: Entity<InputState>,
@@ -243,6 +251,11 @@ impl DesktopApp {
             biometric_event_log: Vec::new(),
             biometric_task: None,
             biometric_op_id: 0,
+            biometric_signal_tx: None,
+            biometric_listener_task: None,
+            biometric_modal_open: false,
+            pending_auto_modal_pensioner: None,
+            pending_biometric_notice: None,
             pending_consumption_pensioner: None,
             consumption_search,
             consumption_special_price,
@@ -355,7 +368,10 @@ impl DesktopApp {
                         this.state.page = Page::Dashboard;
                         this.state.history = vec![Page::Dashboard];
                         this.state.history_index = 0;
-                        AuthStatus::Authenticated(session)
+                        let status = AuthStatus::Authenticated(session);
+                        this.state.auth = status.clone();
+                        this.activate_continuous_biometrics(cx);
+                        status
                     },
                     Err(AuthError::Expired) => AuthStatus::SessionExpired,
                     Err(err) => AuthStatus::Error(err.message().into()),
@@ -369,6 +385,11 @@ impl DesktopApp {
         if let AuthStatus::Authenticated(session) = &self.state.auth { let _ = MockAuthService.logout(session); }
         self.biometric_task = None;
         self.biometric_op_id = self.biometric_op_id.wrapping_add(1);
+        self.biometric_signal_tx = None;
+        self.biometric_listener_task = None;
+        self.biometric_modal_open = false;
+        self.pending_auto_modal_pensioner = None;
+        self.pending_biometric_notice = None;
         self.biometric_gateway.disconnect();
         self.biometric_event_log.clear();
         self.pending_consumption_pensioner = None;
@@ -536,6 +557,26 @@ impl DesktopApp {
 
 impl Render for DesktopApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if let Some(pid) = self.pending_auto_modal_pensioner.take() {
+            let entity = cx.entity().downgrade();
+            window.defer(cx, move |window, cx| {
+                let _ = entity.update(cx, |app, cx| {
+                    app.open_auto_consumption_modal(pid, window, cx);
+                });
+            });
+        }
+        if let Some((is_warn, msg)) = self.pending_biometric_notice.take() {
+            window.defer(cx, move |window, cx| {
+                window.push_notification(
+                    if is_warn {
+                        Notification::warning(msg)
+                    } else {
+                        Notification::info(msg)
+                    },
+                    cx,
+                );
+            });
+        }
         let compact = window.viewport_size().width < px(760.);
         if compact != self.compact {
             if compact {
@@ -557,6 +598,8 @@ impl Render for DesktopApp {
         let signed_in = self.state.auth.user().is_some();
         let account_name = self.state.user.name.clone();
         let account_role = self.state.user.role.clone();
+        let bio_connected = self.biometric_gateway.state().is_connected();
+        let bio_label = self.biometric_gateway.state().label();
         let title = if !signed_in {
             "Comedor".to_string()
         } else if self.denied || !self.state.auth.can_view(self.state.page) {
@@ -677,7 +720,29 @@ impl Render for DesktopApp {
                     h_flex()
                         .id("titlebar-account-controls")
                         .occlude()
+                        .gap_2()
                         .items_center()
+                        .when(bio_connected, |this| {
+                            this.child(
+                                Tag::secondary()
+                                    .small()
+                                    .child(format!("Huella: {bio_label}")),
+                            )
+                            .child(
+                                Button::new("titlebar-sim-finger")
+                                    .ghost()
+                                    .xsmall()
+                                    .icon(LucideIcon::FingerprintPattern)
+                                    .tooltip("Simular lectura biométrica automática")
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.biometric_simulate(
+                                            crate::pages::identification::SimulationMode::MatchActive,
+                                            window,
+                                            cx,
+                                        );
+                                    })),
+                            )
+                        })
                         .child(
                             Button::new("titlebar-account")
                                 .ghost()
