@@ -88,8 +88,9 @@ pub fn render(state: &AppState, cx: &Context<DesktopApp>, app_cx: &App) -> impl 
                 .child(h_flex().gap_4().flex_wrap()
                     .child(card("Raciones entregadas", summary.portions.to_string(), format!("En {} atención(es) del día", summary.attentions()), IconName::Utensils, app_cx))
                     .child(card("Importe consumido", money(summary.consumed_cents), "Consumos de la fecha", IconName::Wallet, app_cx))
-                    .child(card("Pagos recibidos", money(summary.paid_cents), "Pagos de la fecha", IconName::Wallet, app_cx))
-                    .child(card("Deuda pendiente", money(summary.debt_cents), "Acumulada hasta la fecha", IconName::Wallet, app_cx)))
+                    .child(card("Efectivo ingresado", money(summary.cash_paid_cents), "Solo pagos en efectivo", IconName::Wallet, app_cx))
+                    .child(card("Tickets recibidos", format!("{} und.", summary.tickets_count), format!("Equivalente: {}", money(summary.tickets_cents)), IconName::Ticket, app_cx))
+                    .child(card("Deuda pendiente", money(summary.debt_cents), format!("Acumulada · A favor: {}", money(summary.credit_balance_cents)), IconName::Wallet, app_cx)))
                 .child(table(&summary, app_cx)).into_any_element()
         },
     };

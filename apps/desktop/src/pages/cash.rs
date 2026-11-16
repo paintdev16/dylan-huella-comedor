@@ -381,15 +381,15 @@ impl DesktopApp {
             return;
         };
         let debt = data.balance(pid);
-        if debt == 0 {
+        let net_balance = data.net_balance(pid);
+        let op_kind = self.cash_op_kind;
+        if debt == 0 && op_kind != CashOpKind::Tickets {
             window.push_notification(
                 Notification::error("El pensionista no tiene deuda pendiente."),
                 cx,
             );
             return;
         }
-
-        let op_kind = self.cash_op_kind;
         let ticket_count = self.cash_ticket_count.max(1);
         let ticket_unit = data.cash_register.ticket_value_cents;
 
@@ -423,18 +423,6 @@ impl DesktopApp {
             }
             CashOpKind::Tickets => {
                 let total = ticket_unit.saturating_mul(ticket_count as i64);
-                if total > debt {
-                    window.push_notification(
-                        Notification::error(format!(
-                            "Los {} ticket(s) suman {}, lo cual supera la deuda pendiente ({}).",
-                            ticket_count,
-                            amount(total),
-                            amount(debt)
-                        )),
-                        cx,
-                    );
-                    return;
-                }
                 (
                     total,
                     format!(
@@ -488,7 +476,19 @@ impl DesktopApp {
         };
 
         let person_name = person.name();
-        let new_debt = debt - op_cents;
+        let new_net = net_balance - op_cents;
+        let current_balance_label = if net_balance < 0 {
+            format!("Saldo a favor actual: {}", amount(-net_balance))
+        } else {
+            format!("Deuda actual: {}", amount(debt))
+        };
+        let new_balance_label = if new_net < 0 {
+            format!("Saldo a favor resultante: {}", amount(-new_net))
+        } else if new_net > 0 {
+            format!("Saldo restante: {}", amount(new_net))
+        } else {
+            "Saldo restante: S/ 0.00 (Al día)".to_string()
+        };
         let operator_preview = self.state.user.name.clone();
         let dining_hall = self.preferences.dining_hall_name.clone();
         let receipt_date = self.state.dashboard_date.format("%d/%m/%Y").to_string();
@@ -527,13 +527,13 @@ impl DesktopApp {
                                     div()
                                         .text_xs()
                                         .text_color(cx.theme().muted_foreground)
-                                        .child(format!("Deuda actual: {}", amount(debt))),
+                                        .child(current_balance_label.clone()),
                                 )
                                 .child(
                                     div()
                                         .text_sm()
                                         .font_weight(FontWeight::BOLD)
-                                        .child(format!("Saldo restante: {}", amount(new_debt))),
+                                        .child(new_balance_label.clone()),
                                 ),
                         )
                         .child(
@@ -558,7 +558,7 @@ impl DesktopApp {
                                 .child(
                                     div()
                                         .text_xs()
-                                        .child(format!("{summary_text} · Saldo final: {}", amount(new_debt))),
+                                        .child(format!("{summary_text} · {new_balance_label}")),
                                 ),
                         ),
                 )
@@ -735,6 +735,30 @@ impl DesktopApp {
                         )
                         .child(div().text_xs().child(format!("Titular: {person}")))
                         .child(div().text_xs().child(format!("Concepto: {}", mov_item.description)))
+                        .when_some(
+                            mov_item.ticket_count.zip(mov_item.ticket_unit_cents),
+                            |this, (cnt, unit)| {
+                                this.child(div().text_xs().child(format!(
+                                    "Detalle de tickets: {cnt} unidad(es) × {}",
+                                    amount(unit)
+                                )))
+                            },
+                        )
+                        .when_some(mov_item.consumption_cents, |this, cons| {
+                            this.child(div().text_xs().child(format!(
+                                "Consumo asociado: {}",
+                                amount(cons)
+                            )))
+                        })
+                        .when_some(mov_item.resulting_balance_cents, |this, res_bal| {
+                            this.child(div().text_xs().child(if res_bal < 0 {
+                                format!("Saldo resultante: A favor {}", amount(-res_bal))
+                            } else if res_bal > 0 {
+                                format!("Saldo resultante: Deuda {}", amount(res_bal))
+                            } else {
+                                "Saldo resultante: S/ 0.00 (Al día)".to_string()
+                            }))
+                        })
                         .child(
                             h_flex()
                                 .justify_between()
@@ -809,6 +833,7 @@ pub fn render(
     let ticket_unit = data.cash_register.ticket_value_cents;
     let total_debt: i64 = data.pensioners.iter().map(|p| data.balance(p.id)).sum();
     let expected_cash = data.cash_register.opening_cents + data.cash_inflow_cents();
+    let (total_tickets_count, total_tickets_cents) = data.total_tickets();
 
     let query = crate::pages::identification::normalize_search_text(
         &app_view.cash_search.read(app).value(),
@@ -914,6 +939,11 @@ pub fn render(
                 .flex_wrap()
                 .child(kpi_box("Apertura de caja", amount(data.cash_register.opening_cents), app))
                 .child(kpi_box("Cobros en efectivo", amount(data.cash_inflow_cents()), app))
+                .child(kpi_box(
+                    "Tickets recibidos",
+                    format!("{total_tickets_count} und. · {}", amount(total_tickets_cents)),
+                    app,
+                ))
                 .child(kpi_box("Saldo esperado en caja", amount(expected_cash), app))
                 .child(kpi_box("Deuda total pendiente", amount(total_debt), app)),
         )
@@ -1206,7 +1236,12 @@ pub fn render(
                                                 Button::new("cash-register-op-btn")
                                                     .primary()
                                                     .small()
-                                                    .disabled(!can_operate || !is_open || debt == 0)
+                                                    .disabled(
+                                                        !can_operate
+                                                            || !is_open
+                                                            || (app_view.cash_op_kind != CashOpKind::Tickets
+                                                                && debt == 0),
+                                                    )
                                                     .icon(LucideIcon::Check)
                                                     .label("Registrar operación")
                                                     .on_click(cx.listener(|this, _, window, cx| {

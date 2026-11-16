@@ -180,7 +180,10 @@ pub struct DebtReportRow {
     pub total_portions: u32,
     pub consumed_cents: i64,
     pub paid_cents: i64,
+    pub ticket_count: u32,
+    pub ticket_cents: i64,
     pub balance_cents: i64,
+    pub credit_balance_cents: i64,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -193,6 +196,9 @@ pub struct PeriodSummaryRow {
     pub third_party_deliveries: usize,
     pub consumed_cents: i64,
     pub paid_cents: i64,
+    pub cash_paid_cents: i64,
+    pub ticket_count: u32,
+    pub ticket_cents: i64,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -207,7 +213,11 @@ pub struct ReportTotals {
     pub third_party_deliveries: usize,
     pub total_consumed_cents: i64,
     pub total_paid_cents: i64,
+    pub total_cash_paid_cents: i64,
+    pub total_ticket_count: u32,
+    pub total_ticket_cents: i64,
     pub total_debt_cents: i64,
+    pub total_credit_cents: i64,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -407,20 +417,36 @@ impl ReportsDataSource for MockReportsDataSource<'_> {
             }
 
             totals.total_paid_cents += p.cents;
-            daily_map
+            let (cash_delta, t_count, t_cents) = match &p.kind {
+                crate::mock_data::PaymentKind::CashPayment => (p.cents, 0, 0),
+                crate::mock_data::PaymentKind::TicketCredit { count, .. } => (0, *count, p.cents),
+                crate::mock_data::PaymentKind::AuthorizedDiscount { .. } => (0, 0, 0),
+            };
+            totals.total_cash_paid_cents += cash_delta;
+            totals.total_ticket_count += t_count;
+            totals.total_ticket_cents += t_cents;
+
+            let d_row = daily_map
                 .entry(p.date)
                 .or_insert_with(|| PeriodSummaryRow {
                     period_label: p.date.format("%d/%m/%Y").to_string(),
                     ..Default::default()
-                })
-                .paid_cents += p.cents;
-            monthly_map
+                });
+            d_row.paid_cents += p.cents;
+            d_row.cash_paid_cents += cash_delta;
+            d_row.ticket_count += t_count;
+            d_row.ticket_cents += t_cents;
+
+            let m_row = monthly_map
                 .entry((p.date.year(), p.date.month()))
                 .or_insert_with(|| PeriodSummaryRow {
                     period_label: format!("{:02}/{}", p.date.month(), p.date.year()),
                     ..Default::default()
-                })
-                .paid_cents += p.cents;
+                });
+            m_row.paid_cents += p.cents;
+            m_row.cash_paid_cents += cash_delta;
+            m_row.ticket_count += t_count;
+            m_row.ticket_cents += t_cents;
 
             payments.push(PaymentReportRow {
                 movement_id: p.movement_id.clone(),
@@ -449,6 +475,8 @@ impl ReportsDataSource for MockReportsDataSource<'_> {
             let consumed = self.data.consumed_total(person.id);
             let paid = self.data.paid_total(person.id);
             let balance = self.data.balance(person.id);
+            let credit_balance = self.data.credit_balance(person.id);
+            let (ticket_count, ticket_cents) = self.data.tickets_for_pensioner(person.id);
             let portions: u32 = self
                 .data
                 .consumptions
@@ -457,6 +485,7 @@ impl ReportsDataSource for MockReportsDataSource<'_> {
                 .map(|c| c.portions)
                 .sum();
             totals.total_debt_cents += balance;
+            totals.total_credit_cents += credit_balance;
             debts.push(DebtReportRow {
                 pensioner_id: person.id,
                 pensioner_name: p_name,
@@ -464,7 +493,10 @@ impl ReportsDataSource for MockReportsDataSource<'_> {
                 total_portions: portions,
                 consumed_cents: consumed,
                 paid_cents: paid,
+                ticket_count,
+                ticket_cents,
                 balance_cents: balance,
+                credit_balance_cents: credit_balance,
             });
         }
 

@@ -358,15 +358,24 @@ pub fn render(
                     app,
                 ))
                 .child(kpi_card(
-                    "Pagos recibidos",
-                    amount(totals.total_paid_cents),
-                    format!("{} movimiento(s)", snapshot.payments.len()),
+                    "Efectivo ingresado",
+                    amount(totals.total_cash_paid_cents),
+                    format!(
+                        "Tickets: {} und. ({}) · {} mov.",
+                        totals.total_ticket_count,
+                        amount(totals.total_ticket_cents),
+                        snapshot.payments.len()
+                    ),
                     app,
                 ))
                 .child(kpi_card(
                     "Deuda pendiente",
                     amount(totals.total_debt_cents),
-                    format!("{} pensionista(s)", snapshot.debts.len()),
+                    format!(
+                        "{} pensionista(s) · A favor: {}",
+                        snapshot.debts.len(),
+                        amount(totals.total_credit_cents)
+                    ),
                     app,
                 )),
         )
@@ -854,10 +863,22 @@ pub fn render(
                                             ))
                                             .child(text_cell(r.total_portions.to_string(), 75.))
                                             .child(text_cell(amount(r.consumed_cents), 105.))
-                                            .child(text_cell(amount(r.paid_cents), 105.))
+                                            .child(text_cell(
+                                                format!(
+                                                    "{} ({} tkt)",
+                                                    amount(r.paid_cents),
+                                                    r.ticket_count
+                                                ),
+                                                105.,
+                                            ))
                                             .child(div().w(px(120.)).flex_shrink_0().child(
                                                 if r.balance_cents > 0 {
                                                     Tag::warning().small().child(amount(r.balance_cents))
+                                                } else if r.credit_balance_cents > 0 {
+                                                    Tag::info().outline().small().child(format!(
+                                                        "A favor {}",
+                                                        amount(r.credit_balance_cents)
+                                                    ))
                                                 } else {
                                                     Tag::success().outline().small().child("S/ 0.00")
                                                 },
@@ -937,9 +958,11 @@ pub fn render(
                                                 .text_xs()
                                                 .font_weight(FontWeight::SEMIBOLD)
                                                 .child(format!(
-                                                    "Consumos: {} · Pagos: {}",
+                                                    "Consumos: {} · Efectivo: {} · Tickets: {} und. ({})",
                                                     amount(d.consumed_cents),
-                                                    amount(d.paid_cents)
+                                                    amount(d.cash_paid_cents),
+                                                    d.ticket_count,
+                                                    amount(d.ticket_cents)
                                                 )),
                                         )
                                 }))
@@ -995,9 +1018,11 @@ pub fn render(
                                                 .text_xs()
                                                 .font_weight(FontWeight::SEMIBOLD)
                                                 .child(format!(
-                                                    "Consumos: {} · Pagos: {}",
+                                                    "Consumos: {} · Efectivo: {} · Tickets: {} und. ({})",
                                                     amount(m.consumed_cents),
-                                                    amount(m.paid_cents)
+                                                    amount(m.cash_paid_cents),
+                                                    m.ticket_count,
+                                                    amount(m.ticket_cents)
                                                 )),
                                         )
                                 }))

@@ -134,6 +134,7 @@ struct AutoModalState {
     menu_kind: MenuKind,
     portions: u32,
     third_party: bool,
+    ticket_count: u32,
     cart: Vec<DraftConsumptionItem>,
     next_item_id: u64,
     error: Option<String>,
@@ -695,7 +696,7 @@ impl DesktopApp {
             self.resume_waiting_after_modal(cx);
             return;
         }
-        let Some((person_name, bio_id, active, balance)) = (match &self.state.data {
+        let Some((person_name, bio_id, active, net_balance, cash_open, ticket_unit_cents)) = (match &self.state.data {
             DataStatus::Ready(data) => {
                 data.pensioners
                     .iter()
@@ -705,7 +706,9 @@ impl DesktopApp {
                             p.name(),
                             p.biometric_id.clone().unwrap_or_else(|| "—".into()),
                             p.active,
-                            data.balance(p.id),
+                            data.net_balance(p.id),
+                            data.cash_register.is_open,
+                            data.cash_register.ticket_value_cents,
                         )
                     })
             }
@@ -756,6 +759,7 @@ impl DesktopApp {
             menu_kind: MenuKind::Economic,
             portions: 1,
             third_party: false,
+            ticket_count: 0,
             cart: Vec::new(),
             next_item_id: 1,
             error: None,
@@ -796,12 +800,20 @@ impl DesktopApp {
             let menu_kind = st.menu_kind;
             let portions = st.portions;
             let third_party = st.third_party;
+            let ticket_count = st.ticket_count;
             let error_msg = st.error.clone();
             let submitting = st.submitting;
             let econ_unit_cents = pricing.economic_for(meal);
             let cart_items = st.cart.clone();
             let total_portions: u32 = cart_items.iter().map(|i| i.portions).sum();
             let total_cents: i64 = cart_items.iter().map(|i| i.subtotal_cents()).sum();
+            let tickets_value_cents = (ticket_count as i64).saturating_mul(ticket_unit_cents);
+            let final_net_balance = net_balance
+                .saturating_add(total_cents)
+                .saturating_sub(tickets_value_cents);
+            let final_debt_cents = final_net_balance.max(0);
+            let final_credit_cents = (-final_net_balance).max(0);
+            let tickets_need_open_cash = ticket_count > 0 && !cash_open;
 
             let meal_select_view = meal_select.clone();
             let modal_for_econ = modal_state.clone();
@@ -810,6 +822,9 @@ impl DesktopApp {
             let modal_for_inc = modal_state.clone();
             let modal_for_add = modal_state.clone();
             let modal_for_switch = modal_state.clone();
+            let modal_for_ticket_dec = modal_state.clone();
+            let modal_for_ticket_inc = modal_state.clone();
+            let modal_for_ticket_zero = modal_state.clone();
             let modal_for_submit = modal_state.clone();
 
             let sp_price_add = special_price_input.clone();
@@ -876,13 +891,22 @@ impl DesktopApp {
                                             div()
                                                 .text_xs()
                                                 .text_color(cx.theme().muted_foreground)
-                                                .child("Saldo pendiente"),
+                                                .child(if net_balance < 0 {
+                                                    "Saldo a favor"
+                                                } else {
+                                                    "Saldo pendiente"
+                                                }),
                                         )
                                         .child(
                                             div()
                                                 .text_base()
                                                 .font_weight(FontWeight::BOLD)
-                                                .child(amount(balance)),
+                                                .text_color(if net_balance < 0 {
+                                                    cx.theme().primary
+                                                } else {
+                                                    cx.theme().foreground
+                                                })
+                                                .child(amount(net_balance.abs())),
                                         ),
                                 ),
                         )
@@ -1180,21 +1204,190 @@ impl DesktopApp {
                             this.child(Input::new(&third_party_input))
                         })
                         .child(
+                            v_flex()
+                                .gap_1p5()
+                                .p_2p5()
+                                .rounded(cx.theme().radius)
+                                .border_1()
+                                .border_color(cx.theme().border)
+                                .child(
+                                    h_flex()
+                                        .justify_between()
+                                        .gap_2()
+                                        .flex_wrap()
+                                        .child(
+                                            v_flex()
+                                                .gap_0p5()
+                                                .child(
+                                                    div()
+                                                        .text_xs()
+                                                        .font_weight(FontWeight::MEDIUM)
+                                                        .child(format!(
+                                                            "Tickets físicos entregados (valor: {})",
+                                                            amount(ticket_unit_cents)
+                                                        )),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .text_xs()
+                                                        .text_color(cx.theme().muted_foreground)
+                                                        .child(if ticket_count == 0 {
+                                                            if net_balance < 0 {
+                                                                format!(
+                                                                    "Se descontará del saldo a favor actual ({}).",
+                                                                    amount(-net_balance)
+                                                                )
+                                                            } else {
+                                                                "Modo actual: registrar consumo como deuda.".to_string()
+                                                            }
+                                                        } else if final_credit_cents > 0 {
+                                                            format!(
+                                                                "{ticket_count} ticket(s) = {} abonados · {} quedará a favor",
+                                                                amount(tickets_value_cents),
+                                                                amount(final_credit_cents)
+                                                            )
+                                                        } else {
+                                                            format!(
+                                                                "{ticket_count} ticket(s) = {} abonados (deuda final: {})",
+                                                                amount(tickets_value_cents),
+                                                                amount(final_debt_cents)
+                                                            )
+                                                        }),
+                                                ),
+                                        )
+                                        .child(
+                                            h_flex()
+                                                .gap_1()
+                                                .items_center()
+                                                .when(ticket_count > 0, |this| {
+                                                    this.child(
+                                                        Button::new("auto-ticket-zero")
+                                                            .ghost()
+                                                            .xsmall()
+                                                            .label("Solo deuda")
+                                                            .on_click(move |_, _, cx| {
+                                                                modal_for_ticket_zero.update(cx, |s, cx| {
+                                                                    s.ticket_count = 0;
+                                                                    s.error = None;
+                                                                    cx.notify();
+                                                                });
+                                                            }),
+                                                    )
+                                                })
+                                                .child(
+                                                    Button::new("auto-ticket-dec")
+                                                        .outline()
+                                                        .xsmall()
+                                                        .disabled(ticket_count == 0)
+                                                        .label("-")
+                                                        .on_click(move |_, _, cx| {
+                                                            modal_for_ticket_dec.update(cx, |s, cx| {
+                                                                s.ticket_count = s.ticket_count.saturating_sub(1);
+                                                                s.error = None;
+                                                                cx.notify();
+                                                            });
+                                                        }),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .w(px(24.))
+                                                        .text_center()
+                                                        .text_xs()
+                                                        .font_weight(FontWeight::BOLD)
+                                                        .child(ticket_count.to_string()),
+                                                )
+                                                .child(
+                                                    Button::new("auto-ticket-inc")
+                                                        .outline()
+                                                        .xsmall()
+                                                        .disabled(ticket_unit_cents <= 0)
+                                                        .label("+")
+                                                        .on_click(move |_, _, cx| {
+                                                            modal_for_ticket_inc.update(cx, |s, cx| {
+                                                                s.ticket_count = s.ticket_count.saturating_add(1);
+                                                                s.error = None;
+                                                                cx.notify();
+                                                            });
+                                                        }),
+                                                ),
+                                        ),
+                                )
+                                .when(tickets_need_open_cash, |this| {
+                                    this.child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(cx.theme().warning)
+                                            .child("La caja está cerrada: ábrela en Caja para recibir tickets, o deja 0 tickets para registrar como deuda."),
+                                    )
+                                })
+                                .when(!tickets_need_open_cash && ticket_count > 0 && final_credit_cents > 0, |this| {
+                                    this.child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(cx.theme().primary)
+                                            .child(format!(
+                                                "El excedente ({}) se registrará como saldo a favor y se descontará automáticamente de futuros consumos.",
+                                                amount(final_credit_cents)
+                                            )),
+                                    )
+                                }),
+                        )
+                        .child(
                             h_flex()
                                 .justify_between()
                                 .p_2p5()
                                 .rounded(cx.theme().radius)
                                 .bg(cx.theme().muted)
                                 .child(
-                                    div()
-                                        .text_xs()
-                                        .child(format!("Total raciones: {total_portions}")),
+                                    v_flex()
+                                        .gap_0p5()
+                                        .child(
+                                            div()
+                                                .text_xs()
+                                                .child(format!("Total raciones: {total_portions}")),
+                                        )
+                                        .child(
+                                            div()
+                                                .text_xs()
+                                                .text_color(cx.theme().muted_foreground)
+                                                .child(if ticket_count > 0 {
+                                                    format!(
+                                                        "Tickets ({ticket_count} × {}): {}",
+                                                        amount(ticket_unit_cents),
+                                                        amount(tickets_value_cents)
+                                                    )
+                                                } else {
+                                                    "Tickets: 0 (S/ 0.00 abonados)".to_string()
+                                                }),
+                                        ),
                                 )
                                 .child(
-                                    div()
-                                        .text_base()
-                                        .font_weight(FontWeight::BOLD)
-                                        .child(format!("Total: {}", amount(total_cents))),
+                                    v_flex()
+                                        .items_end()
+                                        .gap_0p5()
+                                        .child(
+                                            div()
+                                                .text_base()
+                                                .font_weight(FontWeight::BOLD)
+                                                .child(format!("Consumo: {}", amount(total_cents))),
+                                        )
+                                        .child(
+                                            div()
+                                                .text_xs()
+                                                .font_weight(FontWeight::SEMIBOLD)
+                                                .text_color(if final_net_balance > 0 {
+                                                    cx.theme().warning
+                                                } else {
+                                                    cx.theme().primary
+                                                })
+                                                .child(if final_net_balance < 0 {
+                                                    format!("Saldo final: A favor {}", amount(final_credit_cents))
+                                                } else if final_net_balance > 0 {
+                                                    format!("Saldo final: Deuda {}", amount(final_debt_cents))
+                                                } else {
+                                                    "Saldo final: S/ 0.00 (Al día)".to_string()
+                                                }),
+                                        ),
                                 ),
                         ),
                 )
@@ -1216,14 +1409,24 @@ impl DesktopApp {
                         .child(
                             Button::new("auto-modal-confirm")
                                 .primary()
-                                .disabled(submitting || total_portions == 0)
+                                .disabled(
+                                    submitting
+                                        || total_portions == 0
+                                        || tickets_need_open_cash,
+                                )
                                 .label("Confirmar atención")
                                 .on_click(move |_, window, cx| {
                                     let pickup_name =
                                         third_input_submit.read(cx).value().trim().to_string();
-                                    let (already_submitting, items, is_third, token) = {
+                                    let (already_submitting, items, is_third, tickets, token) = {
                                         let s = modal_for_submit.read(cx);
-                                        (s.submitting, s.cart.clone(), s.third_party, s.token)
+                                        (
+                                            s.submitting,
+                                            s.cart.clone(),
+                                            s.third_party,
+                                            s.ticket_count,
+                                            s.token,
+                                        )
                                     };
                                     if already_submitting {
                                         return;
@@ -1255,16 +1458,24 @@ impl DesktopApp {
                                         let now = chrono::Local::now();
                                         let date = now.date_naive();
                                         let time = now.format("%H:%M").to_string();
+                                        let operator = app.state.user.name.to_string();
                                         let out = match &mut app.state.data {
-                                            DataStatus::Ready(data) => data.record_consumptions(
-                                                date,
-                                                &time,
-                                                pensioner_id,
-                                                &items,
-                                                pickup.as_deref(),
-                                                token,
-                                                &mut app.consumption_processed_tokens,
-                                            ),
+                                            DataStatus::Ready(data) => {
+                                                let res = data.record_consumptions_with_tickets(
+                                                    date,
+                                                    &time,
+                                                    pensioner_id,
+                                                    &items,
+                                                    pickup.as_deref(),
+                                                    tickets,
+                                                    token,
+                                                    &mut app.consumption_processed_tokens,
+                                                );
+                                                if let Ok((_, Some(ref mov_id), _)) = res {
+                                                    data.set_movement_operator(mov_id, &operator);
+                                                }
+                                                res
+                                            }
                                             _ => Err("Los datos no están disponibles.".into()),
                                         };
                                         if out.is_ok() {
@@ -1274,11 +1485,34 @@ impl DesktopApp {
                                     });
 
                                     match res {
-                                        Ok(Ok(count)) => {
+                                        Ok(Ok((count, Some(mov_id), final_net))) => {
                                             window.close_dialog(cx);
+                                            let balance_msg = if final_net < 0 {
+                                                format!("saldo a favor {}", amount(-final_net))
+                                            } else if final_net > 0 {
+                                                format!("deuda final {}", amount(final_net))
+                                            } else {
+                                                "al día".to_string()
+                                            };
                                             window.push_notification(
                                                 Notification::success(format!(
-                                                    "Consumo confirmado ({count} línea(s)). Lector listo para la siguiente huella."
+                                                    "Atención confirmada ({count} línea(s) · {tickets} ticket(s) {mov_id} · {balance_msg})."
+                                                )),
+                                                cx,
+                                            );
+                                        }
+                                        Ok(Ok((count, None, final_net))) => {
+                                            window.close_dialog(cx);
+                                            let balance_msg = if final_net < 0 {
+                                                format!("cubierto con saldo a favor, queda {} a favor", amount(-final_net))
+                                            } else if final_net == 0 {
+                                                "cubierto con saldo a favor, al día".to_string()
+                                            } else {
+                                                format!("deuda total {}", amount(final_net))
+                                            };
+                                            window.push_notification(
+                                                Notification::success(format!(
+                                                    "Consumo confirmado ({count} línea(s) · {balance_msg}). Lector listo para la siguiente huella."
                                                 )),
                                                 cx,
                                             );
