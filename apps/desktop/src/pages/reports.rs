@@ -10,6 +10,7 @@ use gpui_kit::{
         h_flex,
         input::Input,
         scroll::ScrollableElement as _,
+        spinner::Spinner,
         switch::Switch,
         tag::Tag,
         v_flex,
@@ -53,6 +54,19 @@ fn text_cell(value: impl Into<SharedString>, width: f32) -> impl IntoElement {
         .text_xs()
         .truncate()
         .child(value.into())
+}
+
+fn empty_state(icon: LucideIcon, title: &'static str, description: &'static str) -> impl IntoElement {
+    Empty::new().py_8().header(
+        EmptyHeader::new()
+            .media(
+                EmptyMedia::new()
+                    .with_variant(EmptyMediaVariant::Icon)
+                    .child(Icon::new(icon).size_6()),
+            )
+            .title(EmptyTitle::new().child(title))
+            .description(EmptyDescription::new().child(description)),
+    )
 }
 
 fn kpi_card(title: &'static str, value: String, subtitle: String, app: &App) -> impl IntoElement {
@@ -154,11 +168,56 @@ pub fn render(
     app: &App,
 ) -> impl IntoElement {
     let theme = app.theme();
+    let header = v_flex()
+        .gap_1()
+        .child(
+            div()
+                .text_2xl()
+                .font_weight(FontWeight::BOLD)
+                .child("Historial y reportes"),
+        )
+        .child(
+            div()
+                .text_sm()
+                .text_color(theme.muted_foreground)
+                .child("Consultas operativas, resúmenes diarios/mensuales y capa lista para API Axum"),
+        );
+
     let data = match &state.data {
         DataStatus::Ready(data) => data,
-        DataStatus::Loading => return div().child("Cargando reportes…").into_any_element(),
+        DataStatus::Loading => {
+            return v_flex()
+                .gap_5()
+                .child(header)
+                .child(
+                    h_flex()
+                        .gap_3()
+                        .items_center()
+                        .p_6()
+                        .rounded(theme.radius_lg)
+                        .border_1()
+                        .border_color(theme.border)
+                        .bg(theme.colors.list)
+                        .text_color(theme.muted_foreground)
+                        .child(Spinner::new().small())
+                        .child("Cargando reportes…"),
+                )
+                .into_any_element();
+        }
         DataStatus::Error(err) => {
-            return Alert::error("reports-load-err", err.clone()).into_any_element();
+            return v_flex()
+                .gap_4()
+                .child(header)
+                .child(Alert::error("reports-load-err", err.clone()))
+                .child(
+                    h_flex().child(
+                        Button::new("reports-retry")
+                            .outline()
+                            .label("Reintentar")
+                            .on_click(cx.listener(|this, _, _, cx| this.load_demo_data(cx))),
+                    ),
+                )
+                .into_any_element();
         }
     };
 
@@ -253,22 +312,7 @@ pub fn render(
                 .justify_between()
                 .gap_3()
                 .flex_wrap()
-                .child(
-                    v_flex()
-                        .gap_1()
-                        .child(
-                            div()
-                                .text_2xl()
-                                .font_weight(FontWeight::BOLD)
-                                .child("Historial y reportes"),
-                        )
-                        .child(
-                            div()
-                                .text_sm()
-                                .text_color(theme.muted_foreground)
-                                .child("Consultas operativas, resúmenes diarios/mensuales y capa lista para API Axum"),
-                        ),
-                )
+                .child(header)
                 .when_some(selected_pensioner_label, |this, lbl| {
                     this.child(
                         h_flex()
@@ -296,7 +340,8 @@ pub fn render(
                     "Raciones entregadas",
                     totals.total_portions.to_string(),
                     format!(
-                        "Desayunos: {} · Alm. Econ.: {} · Esp.: {}",
+                        "{} atención(es) · Desayunos: {} · Alm. Econ.: {} · Esp.: {}",
+                        totals.total_attentions,
                         totals.breakfast_portions,
                         totals.economic_lunch_portions,
                         totals.special_portions
@@ -304,13 +349,16 @@ pub fn render(
                     app,
                 ))
                 .child(kpi_card(
-                    "Consumos filtrados",
+                    "Importe consumido",
                     amount(totals.total_consumed_cents),
-                    format!("Entregas a terceros: {}", totals.third_party_deliveries),
+                    format!(
+                        "Atenciones: {} · Terceros: {}",
+                        totals.total_attentions, totals.third_party_deliveries
+                    ),
                     app,
                 ))
                 .child(kpi_card(
-                    "Pagos y abonos",
+                    "Pagos recibidos",
                     amount(totals.total_paid_cents),
                     format!("{} movimiento(s)", snapshot.payments.len()),
                     app,
@@ -473,22 +521,12 @@ pub fn render(
                 let (rows_slice, page, total_pages) =
                     paginate(&snapshot.consumptions, app_view.report_page, PAGE_SIZE);
                 if snapshot.consumptions.is_empty() {
-                    Empty::new()
-                        .py_8()
-                        .header(
-                            EmptyHeader::new()
-                                .media(
-                                    EmptyMedia::new()
-                                        .with_variant(EmptyMediaVariant::Icon)
-                                        .child(Icon::new(LucideIcon::FileChartColumn).size_6()),
-                                )
-                                .title(EmptyTitle::new().child("Sin consumos"))
-                                .description(
-                                    EmptyDescription::new()
-                                        .child("No hay consumos que coincidan con los filtros."),
-                                ),
-                        )
-                        .into_any_element()
+                    empty_state(
+                        LucideIcon::FileChartColumn,
+                        "Sin consumos",
+                        "No hay consumos que coincidan con los filtros.",
+                    )
+                    .into_any_element()
                 } else {
                     v_flex()
                         .gap_2()
@@ -560,7 +598,7 @@ pub fn render(
                                                 ))
                                                 .child(text_cell("Entrega / Tercero", 150.)),
                                         )
-                                        .children(rows_slice.iter().map(|r| {
+                                        .children(rows_slice.iter().enumerate().map(|(idx, r)| {
                                             let pid = r.pensioner_id;
                                             let kind_display = if let Some(d) = &r.detail {
                                                 format!("{} · {} ({})", r.meal_label, r.menu_kind_label, d)
@@ -579,7 +617,7 @@ pub fn render(
                                                 ))
                                                 .child(
                                                     div().w(px(175.)).flex_shrink_0().child(
-                                                        Button::new(format!("rep-pick-{pid}-{}", r.time))
+                                                        Button::new(format!("rep-pick-{idx}-{pid}"))
                                                             .ghost()
                                                             .xsmall()
                                                             .label(format!("#{pid} {}", r.pensioner_name))
@@ -622,12 +660,12 @@ pub fn render(
                 let (rows_slice, page, total_pages) =
                     paginate(&snapshot.payments, app_view.report_page, PAGE_SIZE);
                 if snapshot.payments.is_empty() {
-                    div()
-                        .p_6()
-                        .text_sm()
-                        .text_color(theme.muted_foreground)
-                        .child("No hay pagos ni abonos que coincidan con los filtros.")
-                        .into_any_element()
+                    empty_state(
+                        LucideIcon::Wallet,
+                        "Sin pagos ni abonos",
+                        "No hay pagos ni abonos que coincidan con los filtros.",
+                    )
+                    .into_any_element()
                 } else {
                     v_flex()
                         .gap_2()
@@ -726,6 +764,14 @@ pub fn render(
             ReportTab::Debts => {
                 let (rows_slice, page, total_pages) =
                     paginate(&snapshot.debts, app_view.report_page, PAGE_SIZE);
+                if snapshot.debts.is_empty() {
+                    empty_state(
+                        LucideIcon::Users,
+                        "Sin pensionistas",
+                        "No hay pensionistas que coincidan con los filtros.",
+                    )
+                    .into_any_element()
+                } else {
                 v_flex()
                     .gap_2()
                     .child(
@@ -838,6 +884,7 @@ pub fn render(
                         app,
                     ))
                     .into_any_element()
+                }
             }
             ReportTab::Summaries => v_flex()
                 .gap_4()

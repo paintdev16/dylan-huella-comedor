@@ -209,6 +209,7 @@ pub struct CashMovement {
     pub pensioner_id: Option<u32>,
     pub description: String,
     pub cents: i64,
+    pub operator_name: String,
 }
 
 #[derive(Clone, Debug)]
@@ -265,11 +266,20 @@ pub struct DashboardSummary {
     pub active: usize,
     pub breakfasts: usize,
     pub lunches: usize,
+    pub breakfast_portions: u32,
+    pub lunch_portions: u32,
     pub portions: u32,
     pub consumed_cents: i64,
     pub paid_cents: i64,
     pub debt_cents: i64,
     pub activity: Vec<Activity>,
+}
+
+impl DashboardSummary {
+    /// Total de atenciones (transacciones de consumo) registradas en la fecha.
+    pub fn attentions(&self) -> usize {
+        self.breakfasts + self.lunches
+    }
 }
 impl MockData {
     pub fn save_pensioner(
@@ -427,6 +437,7 @@ impl MockData {
             pensioner_id: None,
             description: "Apertura de caja simulada".into(),
             cents: opening_cents,
+            operator_name: "Sistema".into(),
         });
         Ok(mov_id)
     }
@@ -465,6 +476,7 @@ impl MockData {
             pensioner_id: None,
             description: "Cierre y arqueo simulado de caja".into(),
             cents: expected_cents,
+            operator_name: "Sistema".into(),
         });
         Ok((mov_id, expected_cents))
     }
@@ -531,6 +543,7 @@ impl MockData {
             pensioner_id: Some(pensioner_id),
             description: format!("{label} · Pensionista #{pensioner_id}"),
             cents: amount_cents,
+            operator_name: "Sistema".into(),
         });
         Ok(mov_id)
     }
@@ -583,6 +596,7 @@ impl MockData {
                 unit % 100
             ),
             cents: total,
+            operator_name: "Sistema".into(),
         });
         Ok(mov_id)
     }
@@ -625,8 +639,24 @@ impl MockData {
             pensioner_id: Some(pensioner_id),
             description: format!("Descuento ({clean_reason}) · Pensionista #{pensioner_id}"),
             cents: amount_cents,
+            operator_name: "Sistema".into(),
         });
         Ok(mov_id)
+    }
+
+    pub fn set_movement_operator(&mut self, movement_id: &str, operator: &str) {
+        let clean = operator.trim();
+        if clean.is_empty() {
+            return;
+        }
+        if let Some(mov) = self
+            .cash_register
+            .movements
+            .iter_mut()
+            .find(|m| m.id == movement_id)
+        {
+            mov.operator_name = clean.to_string();
+        }
     }
     pub fn set_active(&mut self, id: u32, expected: bool) -> Result<(), &'static str> {
         let person = self
@@ -922,6 +952,7 @@ impl MockData {
                         pensioner_id: None,
                         description: "Apertura inicial de caja simulada".into(),
                         cents: 10000,
+                        operator_name: "Cajero de prueba".into(),
                     },
                     CashMovement {
                         id: "MOV-0002".into(),
@@ -931,6 +962,7 @@ impl MockData {
                         pensioner_id: Some(1),
                         description: "Pago parcial · Pensionista #1".into(),
                         cents: 1000,
+                        operator_name: "Cajero de prueba".into(),
                     },
                     CashMovement {
                         id: "MOV-0003".into(),
@@ -940,6 +972,7 @@ impl MockData {
                         pensioner_id: Some(2),
                         description: "Pago parcial · Pensionista #2".into(),
                         cents: 500,
+                        operator_name: "Administradora de prueba".into(),
                     },
                 ],
             },
@@ -961,8 +994,14 @@ impl MockData {
             }
             if c.date == date {
                 match c.meal {
-                    Meal::Breakfast => result.breakfasts += 1,
-                    Meal::Lunch => result.lunches += 1,
+                    Meal::Breakfast => {
+                        result.breakfasts += 1;
+                        result.breakfast_portions += c.portions;
+                    }
+                    Meal::Lunch => {
+                        result.lunches += 1;
+                        result.lunch_portions += c.portions;
+                    }
                 }
                 result.portions += c.portions;
                 result.consumed_cents += c.cents;

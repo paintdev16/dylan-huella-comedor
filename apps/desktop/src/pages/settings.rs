@@ -22,12 +22,14 @@ use gpui_kit::{
 };
 
 use crate::{
-    biometric_service::BiometricGateway as _,
+    biometric_service::BiometricReaderState,
     layout::DesktopApp,
     mock_data::parse_price_cents,
+    pages::identification::{MealSchedule, SimulationMode, allowed, state_tag},
     settings_store::{
         BiometricBackupStatus, CredentialVault as _, ServerConnectionStatus, ThemePreference,
-        default_preferences_path, save_preferences_to, validate_server_url,
+        default_preferences_path, format_time_minutes, parse_time_minutes, save_preferences_to,
+        validate_meal_schedule, validate_server_url,
     },
     state::{AppState, DataStatus, ServiceStatus},
 };
@@ -62,6 +64,13 @@ impl DesktopApp {
     }
 
     pub fn save_general_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !allowed(&self.state, "settings.update") {
+            window.push_notification(
+                Notification::error("No tienes permiso para actualizar la configuración."),
+                cx,
+            );
+            return;
+        }
         let hall_name = self
             .cfg_dining_hall_input
             .read(cx)
@@ -98,13 +107,48 @@ impl DesktopApp {
             }
         };
 
+        let bs_raw = self.cfg_breakfast_start_input.read(cx).value().to_string();
+        let be_raw = self.cfg_breakfast_end_input.read(cx).value().to_string();
+        let ls_raw = self.cfg_lunch_start_input.read(cx).value().to_string();
+        let le_raw = self.cfg_lunch_end_input.read(cx).value().to_string();
+
+        let schedule = (|| -> Result<(u32, u32, u32, u32), String> {
+            let bs = parse_time_minutes(&bs_raw)?;
+            let be = parse_time_minutes(&be_raw)?;
+            let ls = parse_time_minutes(&ls_raw)?;
+            let le = parse_time_minutes(&le_raw)?;
+            validate_meal_schedule(bs, be, ls, le)?;
+            Ok((bs, be, ls, le))
+        })();
+
+        let (bs_min, be_min, ls_min, le_min) = match schedule {
+            Ok(v) => v,
+            Err(err) => {
+                window.push_notification(Notification::error(err), cx);
+                return;
+            }
+        };
+
         self.preferences.dining_hall_name = hall_name;
         self.preferences.currency_code = "PEN".to_string();
         self.preferences.economic_breakfast_cents = b_cents;
         self.preferences.economic_lunch_cents = l_cents;
         self.preferences.special_default_cents = s_cents;
         self.preferences.ticket_value_cents = t_cents;
+        self.preferences.breakfast_start_minutes = bs_min;
+        self.preferences.breakfast_end_minutes = be_min;
+        self.preferences.lunch_start_minutes = ls_min;
+        self.preferences.lunch_end_minutes = le_min;
         self.preferences.sidebar_collapsed = self.state.sidebar_collapsed;
+
+        self.cfg_breakfast_start_input
+            .update(cx, |i, cx| i.set_value(format_time_minutes(bs_min), window, cx));
+        self.cfg_breakfast_end_input
+            .update(cx, |i, cx| i.set_value(format_time_minutes(be_min), window, cx));
+        self.cfg_lunch_start_input
+            .update(cx, |i, cx| i.set_value(format_time_minutes(ls_min), window, cx));
+        self.cfg_lunch_end_input
+            .update(cx, |i, cx| i.set_value(format_time_minutes(le_min), window, cx));
 
         self.consumption_pricing.economic_breakfast_cents = b_cents;
         self.consumption_pricing.economic_lunch_cents = l_cents;
@@ -116,13 +160,95 @@ impl DesktopApp {
         match self.persist_preferences() {
             Ok(()) => {
                 window.push_notification(
-                    Notification::success("Configuración general guardada localmente."),
+                    Notification::success("Configuración general guardada y aplicada."),
                     cx,
                 );
             }
             Err(err) => {
                 window.push_notification(Notification::error(err), cx);
             }
+        }
+        cx.notify();
+    }
+
+    pub fn set_biometric_identification_enabled(
+        &mut self,
+        enabled: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !allowed(&self.state, "biometrics.identify") {
+            window.push_notification(
+                Notification::error("No tienes permiso para activar o desactivar la identificación biométrica."),
+                cx,
+            );
+            return;
+        }
+        self.preferences.biometric_identification_enabled = enabled;
+        if let Err(err) = self.persist_preferences() {
+            window.push_notification(Notification::error(err), cx);
+            return;
+        }
+        if enabled {
+            self.activate_continuous_biometrics(cx);
+            window.push_notification(
+                Notification::info("Identificación biométrica simulada activada."),
+                cx,
+            );
+        } else {
+            if self.biometric_gateway.state().is_connected() {
+                self.biometric_disconnect(window, cx);
+            }
+            window.push_notification(
+                Notification::info("Identificación biométrica simulada desactivada."),
+                cx,
+            );
+        }
+        cx.notify();
+    }
+
+    pub fn simulate_biometric_reader_error(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !allowed(&self.state, "biometrics.identify") {
+            window.push_notification(
+                Notification::error("No tienes permiso para simular eventos del lector."),
+                cx,
+            );
+            return;
+        }
+        if !self.preferences.biometric_identification_enabled {
+            window.push_notification(
+                Notification::warning("Activa la identificación biométrica simulada para probar errores del lector."),
+                cx,
+            );
+            return;
+        }
+        if !self.biometric_gateway.state().is_connected() {
+            self.biometric_connect(window, cx);
+        }
+        self.biometric_simulate(SimulationMode::DeviceError, window, cx);
+    }
+
+    pub fn recover_biometric_waiting(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !allowed(&self.state, "biometrics.identify") {
+            return;
+        }
+        if !self.preferences.biometric_identification_enabled {
+            window.push_notification(
+                Notification::warning("Activa la identificación biométrica simulada primero."),
+                cx,
+            );
+            return;
+        }
+        if !self.biometric_gateway.state().is_connected() {
+            self.biometric_connect(window, cx);
+            return;
+        }
+        if let Ok(evt) = self.biometric_gateway.start_waiting() {
+            self.push_biometric_event(evt);
+            window.push_notification(
+                Notification::info("Lector biométrico simulado recuperado en espera."),
+                cx,
+            );
         }
         cx.notify();
     }
@@ -264,6 +390,15 @@ pub fn render(
 
     let reader_state = app_view.biometric_gateway.state();
     let reader_connected = reader_state.is_connected();
+    let reader_is_error = matches!(reader_state, BiometricReaderState::Error(_));
+    let reader_needs_recovery = matches!(
+        reader_state,
+        BiometricReaderState::Error(_) | BiometricReaderState::Unrecognized
+    );
+    let can_update_settings = allowed(state, "settings.update");
+    let can_identify_biometrics = allowed(state, "biometrics.identify");
+    let bio_enabled = app_view.preferences.biometric_identification_enabled;
+    let current_auto_meal = MealSchedule::from_preferences(&app_view.preferences).current_meal();
 
     let server_tag = match &app_view.server_status {
         ServerConnectionStatus::Untested => Tag::secondary().small().child("Sin probar"),
@@ -472,11 +607,72 @@ pub fn render(
                                         ),
                                 ),
                         )
+                        .child(Separator::horizontal())
+                        .child(
+                            v_flex()
+                                .gap_2()
+                                .child(
+                                    h_flex()
+                                        .justify_between()
+                                        .gap_2()
+                                        .flex_wrap()
+                                        .child(
+                                            div()
+                                                .text_sm()
+                                                .font_weight(FontWeight::MEDIUM)
+                                                .child("Horarios de atención automática (HH:MM)"),
+                                        )
+                                        .child(
+                                            Tag::info().small().child(format!(
+                                                "Atención actual: {}",
+                                                current_auto_meal.label()
+                                            )),
+                                        ),
+                                )
+                                .child(
+                                    h_flex()
+                                        .gap_3()
+                                        .flex_wrap()
+                                        .child(
+                                            v_flex()
+                                                .flex_1()
+                                                .min_w(px(140.))
+                                                .gap_1()
+                                                .child(div().text_xs().text_color(theme.muted_foreground).child("Inicio desayuno"))
+                                                .child(Input::new(&app_view.cfg_breakfast_start_input)),
+                                        )
+                                        .child(
+                                            v_flex()
+                                                .flex_1()
+                                                .min_w(px(140.))
+                                                .gap_1()
+                                                .child(div().text_xs().text_color(theme.muted_foreground).child("Fin desayuno"))
+                                                .child(Input::new(&app_view.cfg_breakfast_end_input)),
+                                        )
+                                        .child(
+                                            v_flex()
+                                                .flex_1()
+                                                .min_w(px(140.))
+                                                .gap_1()
+                                                .child(div().text_xs().text_color(theme.muted_foreground).child("Inicio almuerzo"))
+                                                .child(Input::new(&app_view.cfg_lunch_start_input)),
+                                        )
+                                        .child(
+                                            v_flex()
+                                                .flex_1()
+                                                .min_w(px(140.))
+                                                .gap_1()
+                                                .child(div().text_xs().text_color(theme.muted_foreground).child("Fin almuerzo"))
+                                                .child(Input::new(&app_view.cfg_lunch_end_input)),
+                                        ),
+                                ),
+                        )
                         .child(
                             h_flex().justify_end().child(
                                 Button::new("cfg-save-general")
                                     .primary()
                                     .small()
+                                    .disabled(!can_update_settings)
                                     .icon(LucideIcon::Check)
                                     .label("Guardar configuración general")
                                     .on_click(cx.listener(|this, _, window, cx| {
@@ -489,7 +685,7 @@ pub fn render(
         .child(
             GroupBox::new()
                 .outline()
-                .title("Configuración de servidor (Backend Axum)")
+                .title("Configuración de servidor (Backend Axum · Simulación local)")
                 .child(
                     v_flex()
                         .gap_4()
@@ -558,10 +754,49 @@ pub fn render(
         .child(
             GroupBox::new()
                 .outline()
-                .title("Configuración biométrica")
+                .title("Configuración biométrica (Simulación local)")
                 .child(
                     v_flex()
                         .gap_3()
+                        .child(
+                            h_flex()
+                                .justify_between()
+                                .gap_4()
+                                .p_3()
+                                .rounded(theme.radius)
+                                .border_1()
+                                .border_color(theme.border)
+                                .bg(theme.muted)
+                                .child(
+                                    v_flex()
+                                        .gap_0p5()
+                                        .child(
+                                            div()
+                                                .text_sm()
+                                                .font_weight(FontWeight::MEDIUM)
+                                                .child("Identificación biométrica automática (simulada)"),
+                                        )
+                                        .child(
+                                            div()
+                                                .text_xs()
+                                                .text_color(theme.muted_foreground)
+                                                .child(if can_identify_biometrics {
+                                                    "Habilita la escucha simulada continua y recupera la espera automáticamente tras cada atención."
+                                                } else {
+                                                    "Tu rol actual no tiene permiso (biometrics.identify) para modificar este control."
+                                                }),
+                                        ),
+                                )
+                                .child(
+                                    Switch::new("cfg-bio-auto-enabled")
+                                        .checked(bio_enabled)
+                                        .disabled(!can_identify_biometrics)
+                                        .accessibility_label("Activar identificación biométrica simulada")
+                                        .on_change(cx.listener(|this, checked: &bool, window, cx| {
+                                            this.set_biometric_identification_enabled(*checked, window, cx);
+                                        })),
+                                ),
+                        )
                         .child(
                             h_flex()
                                 .gap_3()
@@ -569,7 +804,7 @@ pub fn render(
                                 .child(
                                     div()
                                         .flex_1()
-                                        .min_w(px(200.))
+                                        .min_w(px(220.))
                                         .p_3()
                                         .rounded(theme.radius)
                                         .border_1()
@@ -577,8 +812,8 @@ pub fn render(
                                         .child(
                                             v_flex()
                                                 .gap_1()
-                                                .child(div().text_xs().text_color(theme.muted_foreground).child("Estado del lector"))
-                                                .child(div().text_sm().font_weight(FontWeight::BOLD).child(reader_state.label())),
+                                                .child(h_flex().justify_between().gap_2().child(div().text_xs().text_color(theme.muted_foreground).child("Estado del lector")).child(state_tag(reader_state)))
+                                                .child(div().text_xs().font_weight(FontWeight::SEMIBOLD).child(reader_state.label())),
                                         ),
                                 )
                                 .child(
@@ -626,6 +861,7 @@ pub fn render(
                                     Button::new("cfg-bio-toggle-reader")
                                         .outline()
                                         .small()
+                                        .disabled(!can_identify_biometrics || (!reader_connected && !bio_enabled))
                                         .icon(LucideIcon::FingerprintPattern)
                                         .label(if reader_connected {
                                             "Desconectar lector"
@@ -640,6 +876,29 @@ pub fn render(
                                             }
                                         })),
                                 )
+                                .child(
+                                    Button::new("cfg-bio-sim-error")
+                                        .outline()
+                                        .small()
+                                        .disabled(!can_identify_biometrics || !bio_enabled || reader_is_error)
+                                        .icon(LucideIcon::CircleAlert)
+                                        .label("Simular error del lector")
+                                        .on_click(cx.listener(|this, _, window, cx| {
+                                            this.simulate_biometric_reader_error(window, cx);
+                                        })),
+                                )
+                                .when(reader_needs_recovery, |this| {
+                                    this.child(
+                                        Button::new("cfg-bio-recover-wait")
+                                            .primary()
+                                            .small()
+                                            .disabled(!can_identify_biometrics || !bio_enabled)
+                                            .label("Recuperar espera")
+                                            .on_click(cx.listener(|this, _, window, cx| {
+                                                this.recover_biometric_waiting(window, cx);
+                                            })),
+                                    )
+                                })
                                 .child(
                                     Button::new("cfg-bio-sdk")
                                         .outline()

@@ -4,7 +4,7 @@
 //! (captura de huellas y extracción de plantillas) y **SecuSearch Pro**
 //! (identificación 1:N) sin acoplar hardware ni DLLs en esta etapa.
 
-use std::fmt;
+use std::{fmt, sync::Arc};
 
 /// Plantilla biométrica protegida, separada de los datos de negocio.
 #[derive(Clone, PartialEq, Eq)]
@@ -59,7 +59,7 @@ impl BiometricReaderState {
             Self::Connected => "Conectado",
             Self::WaitingFingerprint => "Esperando huella",
             Self::Identifying => "Identificando",
-            Self::Identified { .. } => "Identificado",
+            Self::Identified { .. } => "Reconocido",
             Self::Unrecognized => "No reconocido",
             Self::Error(_) => "Error",
         }
@@ -168,6 +168,23 @@ pub enum IdentificationOutcome {
     NoMatch,
 }
 
+/// Señales de eventos simulados o de dispositivo hacia el monitor continuo.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ContinuousBiometricSignal {
+    FingerMatch { pensioner_id: Option<u32> },
+    FingerUnrecognized,
+    DeviceError(String),
+}
+
+/// Resolvedor desacoplado de señales biométricas (ejecutable en segundo plano sin GPUI).
+pub trait BiometricSignalResolver: Send + Sync {
+    fn resolve(
+        &self,
+        candidates: &[BiometricCandidate],
+        signal: &ContinuousBiometricSignal,
+    ) -> Result<IdentificationOutcome, BiometricError>;
+}
+
 /// Contrato para la búsqueda real 1:N sobre plantillas, no sobre códigos.
 /// Un adaptador SecuSearch debe consultar todas las plantillas registradas,
 /// incluidas las de pensionistas inactivos, y rechazar el enrolamiento ante error.
@@ -205,7 +222,25 @@ pub trait BiometricGateway: Send + Sync {
         biometric_id: &str,
         existing: &[BiometricCandidate],
     ) -> Result<BiometricTemplate, BiometricError>;
+    fn signal_resolver(&self) -> Arc<dyn BiometricSignalResolver>;
     fn cancel(&mut self) -> BiometricEvent;
+
+    /// Libera el bloqueo del modal, retira el dedo si seguía colocado y vuelve a espera.
+    fn resume_waiting(&mut self) -> Vec<BiometricEvent> {
+        let mut events = Vec::new();
+        self.set_modal_locked(false);
+        if self.is_finger_present() {
+            events.push(self.release_finger());
+        }
+        if self.state().is_connected()
+            && !matches!(self.state(), BiometricReaderState::WaitingFingerprint)
+        {
+            if let Ok(evt) = self.start_waiting() {
+                events.push(evt);
+            }
+        }
+        events
+    }
 }
 
 /// Estados del flujo guiado de enrolamiento biométrico.
@@ -288,6 +323,28 @@ impl SimulatedBiometricGateway {
                 biometric_id: c.biometric_id.clone(),
             },
             None => IdentificationOutcome::NoMatch,
+        }
+    }
+}
+
+/// Resolvedor simulado sin hardware ni DLLs externas.
+#[derive(Debug, Default)]
+pub struct SimulatedSignalResolver;
+
+impl BiometricSignalResolver for SimulatedSignalResolver {
+    fn resolve(
+        &self,
+        candidates: &[BiometricCandidate],
+        signal: &ContinuousBiometricSignal,
+    ) -> Result<IdentificationOutcome, BiometricError> {
+        match signal {
+            ContinuousBiometricSignal::FingerMatch { pensioner_id } => {
+                Ok(SimulatedBiometricGateway::simulate_match(candidates, *pensioner_id))
+            }
+            ContinuousBiometricSignal::FingerUnrecognized => Ok(IdentificationOutcome::NoMatch),
+            ContinuousBiometricSignal::DeviceError(msg) => {
+                Err(BiometricError::DeviceError(msg.clone()))
+            }
         }
     }
 }
@@ -420,6 +477,10 @@ impl BiometricGateway for SimulatedBiometricGateway {
         ))
     }
 
+    fn signal_resolver(&self) -> Arc<dyn BiometricSignalResolver> {
+        Arc::new(SimulatedSignalResolver)
+    }
+
     fn cancel(&mut self) -> BiometricEvent {
         self.finger_present = false;
         self.modal_locked = false;
@@ -534,5 +595,69 @@ mod tests {
             },
         ];
         assert_eq!(generate_unique_biometric_id(&existing), "BIO-0003");
+    }
+
+    #[test]
+    fn resume_waiting_releases_lock_and_finger_without_duplicate_events() {
+        let mut gw = SimulatedBiometricGateway::new();
+        gw.connect().unwrap();
+        gw.start_waiting().unwrap();
+        gw.begin_identifying().unwrap();
+        gw.finish_identification(Ok(IdentificationOutcome::Match {
+            pensioner_id: 10,
+            biometric_id: "BIO-0010".into(),
+        }));
+        gw.set_modal_locked(true);
+
+        let events = gw.resume_waiting();
+        assert_eq!(
+            events,
+            vec![
+                BiometricEvent::FingerRemoved,
+                BiometricEvent::ReaderStateChanged(BiometricReaderState::WaitingFingerprint),
+            ]
+        );
+        assert!(!gw.is_modal_locked());
+        assert!(!gw.is_finger_present());
+        assert_eq!(gw.state(), &BiometricReaderState::WaitingFingerprint);
+
+        // Llamar nuevamente es idempotente y no duplica eventos
+        assert!(gw.resume_waiting().is_empty());
+    }
+
+    #[test]
+    fn simulated_signal_resolver_handles_match_nomatch_and_error() {
+        let candidates = vec![BiometricCandidate {
+            pensioner_id: 5,
+            biometric_id: "BIO-0005".into(),
+            active: true,
+        }];
+        let gw = SimulatedBiometricGateway::new();
+        let resolver = gw.signal_resolver();
+
+        assert_eq!(
+            resolver
+                .resolve(&candidates, &ContinuousBiometricSignal::FingerMatch { pensioner_id: None })
+                .unwrap(),
+            IdentificationOutcome::Match {
+                pensioner_id: 5,
+                biometric_id: "BIO-0005".into(),
+            }
+        );
+        assert_eq!(
+            resolver
+                .resolve(&candidates, &ContinuousBiometricSignal::FingerUnrecognized)
+                .unwrap(),
+            IdentificationOutcome::NoMatch
+        );
+        assert_eq!(
+            resolver
+                .resolve(
+                    &candidates,
+                    &ContinuousBiometricSignal::DeviceError("Sensor desconectado".into())
+                )
+                .unwrap_err(),
+            BiometricError::DeviceError("Sensor desconectado".into())
+        );
     }
 }

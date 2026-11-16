@@ -29,8 +29,8 @@ use unicode_normalization::{char::is_combining_mark, UnicodeNormalization};
 
 use crate::{
     biometric_service::{
-        BiometricError, BiometricEvent, BiometricGateway as _, BiometricReaderState,
-        ContinuousBiometricSignal, IdentificationOutcome, SimulatedBiometricGateway,
+        BiometricError, BiometricEvent, BiometricReaderState, ContinuousBiometricSignal,
+        IdentificationOutcome,
     },
     layout::DesktopApp,
     mock_data::{parse_price_cents, DraftConsumptionItem, Meal, MenuKind, MockData},
@@ -44,7 +44,7 @@ pub enum SimulationMode {
     DeviceError,
 }
 
-fn allowed(state: &AppState, permission: &str) -> bool {
+pub(crate) fn allowed(state: &AppState, permission: &str) -> bool {
     state.auth.user().is_some_and(|user| user.can(permission))
 }
 
@@ -58,46 +58,74 @@ fn format_decimal(cents: i64) -> String {
     format!("{}.{:02}", cents / 100, cents.abs() % 100)
 }
 
-fn state_tag(reader_state: &BiometricReaderState) -> Tag {
+pub fn reader_state_tag(reader_state: &BiometricReaderState) -> Tag {
+    let label = reader_state.label();
     match reader_state {
-        BiometricReaderState::Disconnected => Tag::secondary().small().child("Desconectado"),
-        BiometricReaderState::Connected => Tag::info().outline().small().child("Conectado"),
-        BiometricReaderState::WaitingFingerprint => {
-            Tag::warning().outline().small().child("Esperando huella")
-        }
-        BiometricReaderState::Identifying => Tag::info().small().child("Identificando"),
-        BiometricReaderState::Identified { .. } => Tag::success().small().child("Identificado"),
-        BiometricReaderState::Unrecognized => Tag::warning().small().child("No reconocido"),
-        BiometricReaderState::Error(_) => Tag::danger().small().child("Error"),
+        BiometricReaderState::Disconnected => Tag::secondary().small().child(label),
+        BiometricReaderState::Connected => Tag::info().outline().small().child(label),
+        BiometricReaderState::WaitingFingerprint => Tag::warning().outline().small().child(label),
+        BiometricReaderState::Identifying => Tag::info().small().child(label),
+        BiometricReaderState::Identified { .. } => Tag::success().small().child(label),
+        BiometricReaderState::Unrecognized => Tag::warning().small().child(label),
+        BiometricReaderState::Error(_) => Tag::danger().small().child(label),
     }
+}
+
+pub(crate) fn state_tag(reader_state: &BiometricReaderState) -> Tag {
+    reader_state_tag(reader_state)
 }
 
 /// Horario configurable para seleccionar inicialmente Desayuno o Almuerzo.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MealSchedule {
-    /// Hora límite exclusiva (0..=23) hasta la cual se preselecciona Desayuno.
-    pub breakfast_until_hour: u32,
+    pub breakfast_start_minutes: u32,
+    pub breakfast_end_minutes: u32,
+    pub lunch_start_minutes: u32,
+    pub lunch_end_minutes: u32,
 }
 
 impl Default for MealSchedule {
     fn default() -> Self {
         Self {
-            breakfast_until_hour: 11,
+            breakfast_start_minutes: 6 * 60,
+            breakfast_end_minutes: 11 * 60,
+            lunch_start_minutes: 11 * 60,
+            lunch_end_minutes: 16 * 60,
         }
     }
 }
 
 impl MealSchedule {
-    pub fn meal_for_hour(self, hour: u32) -> Meal {
-        if hour < self.breakfast_until_hour {
+    pub fn from_preferences(prefs: &crate::settings_store::AppPreferences) -> Self {
+        Self {
+            breakfast_start_minutes: prefs.breakfast_start_minutes,
+            breakfast_end_minutes: prefs.breakfast_end_minutes,
+            lunch_start_minutes: prefs.lunch_start_minutes,
+            lunch_end_minutes: prefs.lunch_end_minutes,
+        }
+    }
+
+    pub fn meal_for_time(self, hour: u32, minute: u32) -> Meal {
+        let total = hour.saturating_mul(60).saturating_add(minute);
+        if total >= self.breakfast_start_minutes && total < self.breakfast_end_minutes {
+            Meal::Breakfast
+        } else if total >= self.lunch_start_minutes && total < self.lunch_end_minutes {
+            Meal::Lunch
+        } else if total < self.lunch_start_minutes {
             Meal::Breakfast
         } else {
             Meal::Lunch
         }
     }
 
+    #[allow(dead_code)]
+    pub fn meal_for_hour(self, hour: u32) -> Meal {
+        self.meal_for_time(hour, 0)
+    }
+
     pub fn current_meal(self) -> Meal {
-        self.meal_for_hour(chrono::Local::now().hour())
+        let now = chrono::Local::now();
+        self.meal_for_time(now.hour(), now.minute())
     }
 }
 
@@ -143,6 +171,7 @@ pub struct GlobalPensionerChoice {
     pub phone: Option<String>,
     pub biometric_id: Option<String>,
     pub balance_cents: i64,
+    pub search_haystack: String,
 }
 
 impl SearchableListItem for GlobalPensionerChoice {
@@ -150,7 +179,7 @@ impl SearchableListItem for GlobalPensionerChoice {
 
     fn title(&self) -> SharedString {
         format!(
-            "{} · ID #{} · {}",
+            "{} · ID #{} · Saldo: {}",
             self.full_name,
             self.id,
             amount(self.balance_cents)
@@ -194,7 +223,7 @@ impl SearchableListItem for GlobalPensionerChoice {
                     } else {
                         theme.muted_foreground
                     })
-                    .child(amount(self.balance_cents)),
+                    .child(format!("Saldo: {}", amount(self.balance_cents))),
             )
     }
 
@@ -207,17 +236,9 @@ impl SearchableListItem for GlobalPensionerChoice {
         if norm_query.is_empty() {
             return true;
         }
-        let haystack = normalize_search_text(&format!(
-            "{} #{} {} {} {}",
-            self.full_name,
-            self.id,
-            self.id,
-            self.biometric_id.as_deref().unwrap_or(""),
-            self.phone.as_deref().unwrap_or("")
-        ));
         norm_query
             .split_whitespace()
-            .all(|tok| haystack.contains(tok))
+            .all(|tok| self.search_haystack.contains(tok))
     }
 }
 
@@ -227,12 +248,27 @@ pub fn build_global_pensioner_choices(data: &MockData) -> Vec<GlobalPensionerCho
         .pensioners
         .iter()
         .filter(|p| p.active)
-        .map(|p| GlobalPensionerChoice {
-            id: p.id,
-            full_name: p.name(),
-            phone: p.phone.clone(),
-            biometric_id: p.biometric_id.clone(),
-            balance_cents: data.balance(p.id),
+        .map(|p| {
+            let full_name = p.name();
+            let phone_raw = p.phone.as_deref().unwrap_or("");
+            let phone_digits: String = phone_raw.chars().filter(|c| c.is_ascii_digit()).collect();
+            let search_haystack = normalize_search_text(&format!(
+                "{} #{} {} {} {} {}",
+                full_name,
+                p.id,
+                p.id,
+                p.biometric_id.as_deref().unwrap_or(""),
+                phone_raw,
+                phone_digits
+            ));
+            GlobalPensionerChoice {
+                id: p.id,
+                full_name,
+                phone: p.phone.clone(),
+                biometric_id: p.biometric_id.clone(),
+                balance_cents: data.balance(p.id),
+                search_haystack,
+            }
         })
         .collect();
     items.sort_by_key(|p| p.id);
@@ -296,14 +332,15 @@ impl DesktopApp {
         self.biometric_event_log.truncate(8);
     }
 
-    /// Activa el servicio biométrico continuo al iniciar sesión si el usuario tiene permiso.
+    /// Activa el servicio biométrico continuo al iniciar sesión si el usuario tiene permiso
+    /// y la identificación simulada está habilitada en Configuración.
     pub fn activate_continuous_biometrics(&mut self, cx: &mut Context<Self>) {
         let can_use = self
             .state
             .auth
             .user()
-            .is_some_and(|u| u.can("biometrics.identify") || u.can("biometrics.view"));
-        if !can_use {
+            .is_some_and(|u| u.can("biometrics.identify") && u.can("biometrics.view"));
+        if !can_use || !self.preferences.biometric_identification_enabled {
             return;
         }
         if !self.biometric_gateway.state().is_connected() {
@@ -311,8 +348,13 @@ impl DesktopApp {
                 self.push_biometric_event(evt);
             }
         }
-        if let Ok(wait_evt) = self.biometric_gateway.start_waiting() {
-            self.push_biometric_event(wait_evt);
+        if !matches!(
+            self.biometric_gateway.state(),
+            BiometricReaderState::WaitingFingerprint
+        ) {
+            if let Ok(wait_evt) = self.biometric_gateway.start_waiting() {
+                self.push_biometric_event(wait_evt);
+            }
         }
         self.start_biometric_signal_loop(cx);
         cx.notify();
@@ -361,6 +403,18 @@ impl DesktopApp {
         {
             return;
         }
+        if !self.preferences.biometric_identification_enabled {
+            self.pending_biometric_notice = Some((
+                true,
+                "La identificación biométrica simulada está desactivada en Configuración.".into(),
+            ));
+            cx.notify();
+            return;
+        }
+        if self.biometric_modal_open {
+            // Bloquea nuevas identificaciones mientras exista una atención abierta.
+            return;
+        }
         if !self.biometric_gateway.state().is_connected() {
             self.pending_biometric_notice = Some((
                 true,
@@ -376,7 +430,7 @@ impl DesktopApp {
                 self.push_biometric_event(evt);
             }
             Err(BiometricError::ModalLocked | BiometricError::FingerStillPresent) => {
-                // Evita identificaciones repetidas mientras el modal esté abierto o el dedo siga ahí.
+                // Evita identificaciones repetidas mientras el modal esté abierto o el dedo siga colocado.
                 return;
             }
             Err(err) => {
@@ -390,21 +444,14 @@ impl DesktopApp {
             DataStatus::Ready(data) => data.biometric_candidates(),
             _ => Vec::new(),
         };
+        let resolver = self.biometric_gateway.signal_resolver();
         self.biometric_op_id = self.biometric_op_id.wrapping_add(1);
         let op_id = self.biometric_op_id;
         cx.notify();
 
         let bg_task = cx.background_spawn(async move {
             std::thread::sleep(Duration::from_millis(240));
-            match signal {
-                ContinuousBiometricSignal::FingerMatch { pensioner_id } => Ok(
-                    SimulatedBiometricGateway::simulate_match(&candidates, pensioner_id),
-                ),
-                ContinuousBiometricSignal::FingerUnrecognized => Ok(IdentificationOutcome::NoMatch),
-                ContinuousBiometricSignal::DeviceError(msg) => {
-                    Err(BiometricError::DeviceError(msg))
-                }
-            }
+            resolver.resolve(&candidates, &signal)
         });
 
         self.biometric_task = Some(cx.spawn(async move |this, cx| {
@@ -431,18 +478,36 @@ impl DesktopApp {
                             app.push_biometric_event(evt_r);
                             app.pending_biometric_notice = Some((
                                 false,
-                                format!("Pensionista #{pensioner_id} identificado.").into(),
+                                format!("Pensionista #{pensioner_id} reconocido.").into(),
                             ));
                         }
                     }
                     Ok(IdentificationOutcome::NoMatch) => {
                         app.pending_biometric_notice = Some((
                             true,
-                            "Huella no reconocida. El lector continúa esperando.".into(),
+                            "Huella no reconocida. El lector volverá a estado de espera.".into(),
                         ));
-                        if let Ok(wait_evt) = app.biometric_gateway.start_waiting() {
-                            app.push_biometric_event(wait_evt);
-                        }
+                        let reset_delay = cx.background_spawn(async {
+                            std::thread::sleep(Duration::from_millis(2500));
+                        });
+                        cx.spawn(async move |this, cx| {
+                            reset_delay.await;
+                            let _ = this.update(cx, |app, cx| {
+                                if app.biometric_op_id == op_id
+                                    && !app.biometric_modal_open
+                                    && matches!(
+                                        app.biometric_gateway.state(),
+                                        BiometricReaderState::Unrecognized
+                                    )
+                                {
+                                    if let Ok(wait_evt) = app.biometric_gateway.start_waiting() {
+                                        app.push_biometric_event(wait_evt);
+                                        cx.notify();
+                                    }
+                                }
+                            });
+                        })
+                        .detach();
                     }
                     Err(err) => {
                         app.pending_biometric_notice = Some((true, err.to_string().into()));
@@ -455,15 +520,45 @@ impl DesktopApp {
 
     pub fn resume_waiting_after_modal(&mut self, cx: &mut Context<Self>) {
         self.biometric_modal_open = false;
-        self.biometric_gateway.set_modal_locked(false);
-        let rel = self.biometric_gateway.release_finger();
-        self.push_biometric_event(rel);
-        if self.biometric_gateway.state().is_connected() {
+        if self.preferences.biometric_identification_enabled {
+            let events = self.biometric_gateway.resume_waiting();
+            for evt in events {
+                self.push_biometric_event(evt);
+            }
+        } else {
+            self.biometric_gateway.set_modal_locked(false);
+            if self.biometric_gateway.is_finger_present() {
+                let evt = self.biometric_gateway.release_finger();
+                self.push_biometric_event(evt);
+            }
+        }
+        self.pending_global_search_clear = true;
+        if std::mem::take(&mut self.global_search_opened_modal) {
+            self.pending_global_search_focus = true;
+        }
+        cx.notify();
+    }
+
+    pub fn biometric_release_finger(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.biometric_modal_open || !self.biometric_gateway.is_finger_present() {
+            return;
+        }
+        let evt = self.biometric_gateway.release_finger();
+        self.push_biometric_event(evt);
+        if self.biometric_gateway.state().is_connected()
+            && !matches!(
+                self.biometric_gateway.state(),
+                BiometricReaderState::WaitingFingerprint
+            )
+        {
             if let Ok(wait_evt) = self.biometric_gateway.start_waiting() {
                 self.push_biometric_event(wait_evt);
             }
         }
-        self.pending_global_search_clear = true;
+        window.push_notification(
+            Notification::info("Dedo retirado del sensor. Lector en espera."),
+            cx,
+        );
         cx.notify();
     }
 
@@ -474,13 +569,13 @@ impl DesktopApp {
         pensioner_id: u32,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) {
+    ) -> bool {
         if !allowed(&self.state, "consumptions.create") {
             window.push_notification(
                 Notification::error("No tienes permiso para registrar consumos."),
                 cx,
             );
-            return;
+            return false;
         }
         if self.biometric_modal_open || window.has_active_dialog(cx) {
             window.push_notification(
@@ -489,7 +584,7 @@ impl DesktopApp {
             );
             self.pending_global_search_clear = true;
             cx.notify();
-            return;
+            return false;
         }
         let active_name = match &self.state.data {
             DataStatus::Ready(data) => data
@@ -506,7 +601,7 @@ impl DesktopApp {
             );
             self.pending_global_search_clear = true;
             cx.notify();
-            return;
+            return false;
         };
         if !active {
             window.push_notification(
@@ -517,7 +612,7 @@ impl DesktopApp {
             );
             self.pending_global_search_clear = true;
             cx.notify();
-            return;
+            return false;
         }
 
         self.biometric_task = None;
@@ -525,6 +620,7 @@ impl DesktopApp {
         self.biometric_modal_open = true;
         self.biometric_gateway.set_modal_locked(true);
         self.open_auto_consumption_modal(pensioner_id, window, cx);
+        true
     }
 
     pub fn biometric_connect(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -631,7 +727,7 @@ impl DesktopApp {
         }
 
         let pricing = self.consumption_pricing;
-        let initial_meal = MealSchedule::default().current_meal();
+        let initial_meal = MealSchedule::from_preferences(&self.preferences).current_meal();
         let initial_meal_idx = match initial_meal {
             Meal::Breakfast => 0,
             Meal::Lunch => 1,
@@ -690,6 +786,7 @@ impl DesktopApp {
             s._meal_subscription = Some(meal_sub);
         });
 
+        self.pending_global_search_clear = true;
         let app_weak = cx.entity().downgrade();
         let app_on_cancel = app_weak.clone();
 
@@ -870,6 +967,7 @@ impl DesktopApp {
                                                     modal_for_dec.update(cx, |s, cx| {
                                                         s.portions =
                                                             s.portions.saturating_sub(1).max(1);
+                                                        s.error = None;
                                                         cx.notify();
                                                     });
                                                 }),
@@ -890,6 +988,7 @@ impl DesktopApp {
                                                 .on_click(move |_, _, cx| {
                                                     modal_for_inc.update(cx, |s, cx| {
                                                         s.portions = s.portions.saturating_add(1);
+                                                        s.error = None;
                                                         cx.notify();
                                                     });
                                                 }),
@@ -1071,6 +1170,7 @@ impl DesktopApp {
                                         .on_change(move |checked: &bool, _, cx| {
                                             modal_for_switch.update(cx, |s, cx| {
                                                 s.third_party = *checked;
+                                                s.error = None;
                                                 cx.notify();
                                             });
                                         }),
@@ -1205,6 +1305,8 @@ pub fn render(
     state: &AppState,
     reader_state: &BiometricReaderState,
     event_log: &[SharedString],
+    finger_present: bool,
+    modal_open: bool,
     cx: &Context<DesktopApp>,
     app: &App,
 ) -> impl IntoElement {
@@ -1212,6 +1314,7 @@ pub fn render(
     let is_connected = reader_state.is_connected();
     let is_identifying = matches!(reader_state, BiometricReaderState::Identifying);
     let can_identify = allowed(state, "biometrics.identify");
+    let sim_disabled = !is_connected || is_identifying || modal_open || !can_identify;
     let (ring_color, icon_color) = match reader_state {
         BiometricReaderState::Disconnected => (theme.border, theme.muted_foreground),
         BiometricReaderState::Connected => (theme.info, theme.info),
@@ -1263,7 +1366,14 @@ pub fn render(
                 .child(
                     h_flex()
                         .gap_2()
+                        .flex_wrap()
                         .child(state_tag(reader_state))
+                        .when(finger_present, |this| {
+                            this.child(Tag::info().outline().small().child("Dedo colocado"))
+                        })
+                        .when(modal_open, |this| {
+                            this.child(Tag::warning().small().child("Atención en curso"))
+                        })
                         .when(!is_connected, |this| {
                             this.child(
                                 Button::new("bio-connect")
@@ -1341,6 +1451,12 @@ pub fn render(
                                                 .child(reader_state.description()),
                                         ),
                                 )
+                                .when(modal_open, |this| {
+                                    this.child(Alert::warning(
+                                        "bio-modal-lock-alert",
+                                        "Atención abierta: nuevas identificaciones bloqueadas hasta confirmar o cancelar.",
+                                    ))
+                                })
                                 .child(
                                     h_flex()
                                         .gap_2()
@@ -1350,9 +1466,9 @@ pub fn render(
                                             Button::new("bio-sim-match")
                                                 .primary()
                                                 .small()
-                                                .disabled(!is_connected || is_identifying || !can_identify)
+                                                .disabled(sim_disabled)
                                                 .icon(LucideIcon::FingerprintPattern)
-                                                .label("Simular dedo en lector")
+                                                .label("Simular huella reconocida")
                                                 .on_click(cx.listener(|this, _, window, cx| {
                                                     this.biometric_simulate(
                                                         SimulationMode::MatchActive,
@@ -1365,7 +1481,7 @@ pub fn render(
                                             Button::new("bio-sim-nomatch")
                                                 .outline()
                                                 .small()
-                                                .disabled(!is_connected || is_identifying || !can_identify)
+                                                .disabled(sim_disabled)
                                                 .label("Simular no reconocido")
                                                 .on_click(cx.listener(|this, _, window, cx| {
                                                     this.biometric_simulate(
@@ -1379,7 +1495,7 @@ pub fn render(
                                             Button::new("bio-sim-error")
                                                 .outline()
                                                 .small()
-                                                .disabled(!is_connected || is_identifying || !can_identify)
+                                                .disabled(sim_disabled)
                                                 .label("Simular error")
                                                 .on_click(cx.listener(|this, _, window, cx| {
                                                     this.biometric_simulate(
@@ -1389,6 +1505,17 @@ pub fn render(
                                                     );
                                                 })),
                                         )
+                                        .when(finger_present && !modal_open, |this| {
+                                            this.child(
+                                                Button::new("bio-release-finger")
+                                                    .outline()
+                                                    .small()
+                                                    .label("Retirar dedo")
+                                                    .on_click(cx.listener(|this, _, window, cx| {
+                                                        this.biometric_release_finger(window, cx);
+                                                    })),
+                                            )
+                                        })
                                         .when(is_connected, |this| {
                                             this.child(
                                                 Button::new("bio-cancel")
@@ -1399,8 +1526,7 @@ pub fn render(
                                                         this.biometric_cancel(window, cx);
                                                     })),
                                             )
-                                        })
-                                        ,
+                                        }),
                                 ),
                         ),
                 )

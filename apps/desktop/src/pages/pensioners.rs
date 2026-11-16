@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use crate::{
     biometric_service::{
-        BiometricEvent, BiometricGateway as _, EnrollmentStep, generate_unique_biometric_id,
+        BiometricEvent, EnrollmentStep, generate_unique_biometric_id,
     },
     layout::DesktopApp,
     mock_data::{MockData, Pensioner},
@@ -10,7 +10,7 @@ use crate::{
 };
 use gpui_kit::{
     App, AppContext as _, Context, Entity, FontWeight, IntoElement, ParentElement, SharedString,
-    Styled, Window,
+    Styled, WeakEntity, Window,
     assets::IconName as LucideIcon,
     component::{
         ActiveTheme as _, Disableable as _, Icon, Sizable as _, WindowExt as _,
@@ -92,6 +92,85 @@ fn enrollment_tag(step: &EnrollmentStep) -> Tag {
         EnrollmentStep::Registered { .. } => Tag::success().small().child("Registrada (simulada)"),
         EnrollmentStep::Error(_) => Tag::danger().small().child("Error"),
     }
+}
+
+/// Simula secuencialmente las etapas: esperando dedo → capturando → verificando → registrada.
+fn start_simulated_enrollment_capture(
+    enroll_state: Entity<NewEnrollFormState>,
+    app: WeakEntity<DesktopApp>,
+    initial_wait_ms: u64,
+    cx: &mut App,
+) {
+    let seq = enroll_state.update(cx, |s, cx| {
+        s.op_seq = s.op_seq.wrapping_add(1);
+        s.step = if initial_wait_ms > 0 {
+            EnrollmentStep::WaitingFinger
+        } else {
+            EnrollmentStep::Capturing
+        };
+        cx.notify();
+        s.op_seq
+    });
+    let enroll_weak = enroll_state.downgrade();
+    cx.spawn(async move |cx| {
+        if initial_wait_ms > 0 {
+            cx.background_spawn(async move {
+                std::thread::sleep(Duration::from_millis(initial_wait_ms));
+            })
+            .await;
+            let still_valid = enroll_weak
+                .update(cx, |s, cx| {
+                    if s.op_seq != seq || !s.enabled || !s.consent_given {
+                        return false;
+                    }
+                    s.step = EnrollmentStep::Capturing;
+                    cx.notify();
+                    true
+                })
+                .unwrap_or(false);
+            if !still_valid {
+                return;
+            }
+        }
+        cx.background_spawn(async move {
+            std::thread::sleep(Duration::from_millis(220));
+        })
+        .await;
+        let still_valid = enroll_weak
+            .update(cx, |s, cx| {
+                if s.op_seq != seq || !s.enabled || !s.consent_given {
+                    return false;
+                }
+                s.step = EnrollmentStep::Verifying;
+                cx.notify();
+                true
+            })
+            .unwrap_or(false);
+        if !still_valid {
+            return;
+        }
+        cx.background_spawn(async move {
+            std::thread::sleep(Duration::from_millis(220));
+        })
+        .await;
+        let candidates = app
+            .read_with(cx, |app, _| match &app.state.data {
+                DataStatus::Ready(d) => d.biometric_candidates(),
+                _ => Vec::new(),
+            })
+            .unwrap_or_default();
+        let generated = generate_unique_biometric_id(&candidates);
+        let _ = enroll_weak.update(cx, |s, cx| {
+            if s.op_seq != seq || !s.enabled || !s.consent_given {
+                return;
+            }
+            s.step = EnrollmentStep::Registered {
+                biometric_id: generated,
+            };
+            cx.notify();
+        });
+    })
+    .detach();
 }
 
 impl DesktopApp {
@@ -189,6 +268,8 @@ impl DesktopApp {
             let enroll_submit = enroll_state.clone();
 
             let app_cap = app.clone();
+            let app_switch = app.clone();
+            let app_consent = app.clone();
             let app_save = app_on_save.clone();
             let app_cancel_dlg = app_on_cancel_dlg.clone();
             let app_cancel_btn = app_on_cancel_btn.clone();
@@ -302,7 +383,7 @@ impl DesktopApp {
                                                     .checked(enr.enabled)
                                                     .disabled(!can_enroll || !reader_available || is_busy)
                                                     .on_change(move |checked: &bool, _, cx| {
-                                                        enroll_switch.update(cx, |s, cx| {
+                                                        let should_start = enroll_switch.update(cx, |s, cx| {
                                                             s.enabled = *checked;
                                                             s.op_seq = s.op_seq.wrapping_add(1);
                                                             s.step = if *checked {
@@ -311,7 +392,16 @@ impl DesktopApp {
                                                                 EnrollmentStep::Idle
                                                             };
                                                             cx.notify();
+                                                            *checked && s.consent_given
                                                         });
+                                                        if should_start {
+                                                            start_simulated_enrollment_capture(
+                                                                enroll_switch.clone(),
+                                                                app_switch.clone(),
+                                                                240,
+                                                                cx,
+                                                            );
+                                                        }
                                                     }),
                                             ),
                                     )
@@ -321,10 +411,30 @@ impl DesktopApp {
                                                 .checked(enr.consent_given)
                                                 .label("Consentimiento informado otorgado (alternativa: identificación manual)")
                                                 .on_click(move |checked: &bool, _, cx| {
-                                                    enroll_consent.update(cx, |s, cx| {
+                                                    let should_start = enroll_consent.update(cx, |s, cx| {
                                                         s.consent_given = *checked;
+                                                        if !*checked && !matches!(s.step, EnrollmentStep::Registered { .. }) {
+                                                            s.op_seq = s.op_seq.wrapping_add(1);
+                                                            s.step = EnrollmentStep::WaitingFinger;
+                                                        }
                                                         cx.notify();
+                                                        *checked
+                                                            && s.enabled
+                                                            && !matches!(
+                                                                s.step,
+                                                                EnrollmentStep::Capturing
+                                                                    | EnrollmentStep::Verifying
+                                                                    | EnrollmentStep::Registered { .. }
+                                                            )
                                                     });
+                                                    if should_start {
+                                                        start_simulated_enrollment_capture(
+                                                            enroll_consent.clone(),
+                                                            app_consent.clone(),
+                                                            240,
+                                                            cx,
+                                                        );
+                                                    }
                                                 }),
                                         )
                                         .child(
@@ -371,49 +481,12 @@ impl DesktopApp {
                                                                     _ => "Simular captura",
                                                                 })
                                                                 .on_click(move |_, _, cx| {
-                                                                    let seq = enroll_capture.update(cx, |s, cx| {
-                                                                        s.op_seq = s.op_seq.wrapping_add(1);
-                                                                        s.step = EnrollmentStep::Capturing;
-                                                                        cx.notify();
-                                                                        s.op_seq
-                                                                    });
-                                                                    let enroll_weak = enroll_capture.downgrade();
-                                                                    let app_for_dup = app_cap.clone();
-                                                                    cx.spawn(async move |cx| {
-                                                                        cx.background_spawn(async move {
-                                                                            std::thread::sleep(Duration::from_millis(200));
-                                                                        }).await;
-                                                                        let still_valid = enroll_weak.update(cx, |s, cx| {
-                                                                            if s.op_seq != seq {
-                                                                                return false;
-                                                                            }
-                                                                            s.step = EnrollmentStep::Verifying;
-                                                                            cx.notify();
-                                                                            true
-                                                                        }).unwrap_or(false);
-                                                                        if !still_valid {
-                                                                            return;
-                                                                        }
-                                                                        cx.background_spawn(async move {
-                                                                            std::thread::sleep(Duration::from_millis(220));
-                                                                        }).await;
-                                                                        let candidates = app_for_dup
-                                                                            .read_with(cx, |app, _| match &app.state.data {
-                                                                                DataStatus::Ready(d) => d.biometric_candidates(),
-                                                                                _ => Vec::new(),
-                                                                            })
-                                                                            .unwrap_or_default();
-                                                                        let generated = generate_unique_biometric_id(&candidates);
-                                                                        let _ = enroll_weak.update(cx, |s, cx| {
-                                                                            if s.op_seq != seq {
-                                                                                return;
-                                                                            }
-                                                                            s.step = EnrollmentStep::Registered {
-                                                                                biometric_id: generated,
-                                                                            };
-                                                                            cx.notify();
-                                                                        });
-                                                                    }).detach();
+                                                                    start_simulated_enrollment_capture(
+                                                                        enroll_capture.clone(),
+                                                                        app_cap.clone(),
+                                                                        0,
+                                                                        cx,
+                                                                    );
                                                                 }),
                                                         )
                                                         .child(
@@ -639,6 +712,9 @@ impl DesktopApp {
         });
 
         let app = cx.entity().downgrade();
+        if reader_connected {
+            start_simulated_enrollment_capture(modal_state.clone(), app.clone(), 280, cx);
+        }
         let app_cancel_dlg = app.clone();
         let app_cancel_btn = app.clone();
         let app_cap = app.clone();
@@ -764,57 +840,12 @@ impl DesktopApp {
                                         .icon(LucideIcon::FingerprintPattern)
                                         .label(if captured_id.is_some() { "Captura simulada completada" } else { "Simular captura" })
                                         .on_click(move |_, _, cx| {
-                                            let seq = modal_cap.update(cx, |s, cx| {
-                                                s.op_seq = s.op_seq.wrapping_add(1);
-                                                s.step = EnrollmentStep::Capturing;
-                                                cx.notify();
-                                                s.op_seq
-                                            });
-                                            let weak_modal = modal_cap.downgrade();
-                                            let app_ref = app_cap_cb.clone();
-                                            cx.spawn(async move |cx| {
-                                                cx.background_spawn(async move {
-                                                    std::thread::sleep(Duration::from_millis(200));
-                                                })
-                                                .await;
-                                                let ok = weak_modal
-                                                    .update(cx, |s, cx| {
-                                                        if s.op_seq != seq {
-                                                            return false;
-                                                        }
-                                                        s.step = EnrollmentStep::Verifying;
-                                                        cx.notify();
-                                                        true
-                                                    })
-                                                    .unwrap_or(false);
-                                                if !ok {
-                                                    return;
-                                                }
-                                                cx.background_spawn(async move {
-                                                    std::thread::sleep(Duration::from_millis(220));
-                                                })
-                                                .await;
-                                                let candidates = app_ref
-                                                    .read_with(cx, |app, _| match &app.state.data {
-                                                        DataStatus::Ready(d) => {
-                                                            d.biometric_candidates()
-                                                        }
-                                                        _ => Vec::new(),
-                                                    })
-                                                    .unwrap_or_default();
-                                                let generated =
-                                                    generate_unique_biometric_id(&candidates);
-                                                let _ = weak_modal.update(cx, |s, cx| {
-                                                    if s.op_seq != seq {
-                                                        return;
-                                                    }
-                                                    s.step = EnrollmentStep::Registered {
-                                                        biometric_id: generated,
-                                                    };
-                                                    cx.notify();
-                                                });
-                                            })
-                                            .detach();
+                                            start_simulated_enrollment_capture(
+                                                modal_cap.clone(),
+                                                app_cap_cb.clone(),
+                                                0,
+                                                cx,
+                                            );
                                         }),
                                 )
                                 .child(

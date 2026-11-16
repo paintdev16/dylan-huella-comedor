@@ -265,6 +265,8 @@ impl DesktopApp {
                                     let raw_open = o_submit.read(cx).value().to_string();
                                     let parsed_open = if is_open {
                                         Ok(0)
+                                    } else if raw_open.trim() == "0" || raw_open.trim() == "0.00" {
+                                        Ok(0)
                                     } else {
                                         parse_price_cents(&raw_open)
                                     };
@@ -284,6 +286,7 @@ impl DesktopApp {
                                             return Err("Operación en curso.".to_string());
                                         }
                                         this.cash_submitting = true;
+                                        let operator = this.state.user.name.to_string();
                                         let date = this.state.dashboard_date;
                                         let out = match &mut this.state.data {
                                             DataStatus::Ready(data) => {
@@ -295,6 +298,7 @@ impl DesktopApp {
                                                         &mut this.cash_processed_tokens,
                                                     )
                                                     .map(|(id, exp)| {
+                                                        data.set_movement_operator(&id, &operator);
                                                         format!(
                                                             "Caja cerrada ({id}) · Arqueo: {}",
                                                             amount(exp)
@@ -308,7 +312,10 @@ impl DesktopApp {
                                                         token,
                                                         &mut this.cash_processed_tokens,
                                                     )
-                                                    .map(|id| format!("Caja abierta ({id})."))
+                                                    .map(|id| {
+                                                        data.set_movement_operator(&id, &operator);
+                                                        format!("Caja abierta ({id}).")
+                                                    })
                                                 }
                                             }
                                             _ => Err("Datos no disponibles.".into()),
@@ -482,6 +489,9 @@ impl DesktopApp {
 
         let person_name = person.name();
         let new_debt = debt - op_cents;
+        let operator_preview = self.state.user.name.clone();
+        let dining_hall = self.preferences.dining_hall_name.clone();
+        let receipt_date = self.state.dashboard_date.format("%d/%m/%Y").to_string();
         let token = self.cash_confirm_token;
         let app = cx.entity().downgrade();
 
@@ -490,6 +500,9 @@ impl DesktopApp {
             let summary_text = op_summary.clone();
             let p_name = person_name.clone();
             let reason_submit = reason.clone();
+            let op_name = operator_preview.clone();
+            let hall_name = dining_hall.clone();
+            let r_date = receipt_date.clone();
 
             dialog
                 .title("Confirmar operación de caja")
@@ -501,7 +514,7 @@ impl DesktopApp {
                                 .text_sm()
                                 .child(format!("Pensionista: {p_name} (ID #{pid})")),
                         )
-                        .child(div().text_sm().font_weight(FontWeight::SEMIBOLD).child(summary_text))
+                        .child(div().text_sm().font_weight(FontWeight::SEMIBOLD).child(summary_text.clone()))
                         .child(
                             h_flex()
                                 .justify_between()
@@ -520,7 +533,32 @@ impl DesktopApp {
                                     div()
                                         .text_sm()
                                         .font_weight(FontWeight::BOLD)
-                                        .child(format!("Nuevo saldo: {}", amount(new_debt))),
+                                        .child(format!("Saldo restante: {}", amount(new_debt))),
+                                ),
+                        )
+                        .child(
+                            v_flex()
+                                .gap_1()
+                                .p_2p5()
+                                .rounded(cx.theme().radius)
+                                .border_1()
+                                .border_color(cx.theme().border)
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .font_weight(FontWeight::BOLD)
+                                        .child(format!("Vista previa de comprobante · {hall_name}")),
+                                )
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(cx.theme().muted_foreground)
+                                        .child(format!("Fecha: {r_date} · Responsable: {op_name}")),
+                                )
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .child(format!("{summary_text} · Saldo final: {}", amount(new_debt))),
                                 ),
                         ),
                 )
@@ -548,35 +586,42 @@ impl DesktopApp {
                                             );
                                         }
                                         this.cash_submitting = true;
+                                        let operator = this.state.user.name.to_string();
                                         let date = this.state.dashboard_date;
                                         let out = match &mut this.state.data {
-                                            DataStatus::Ready(data) => match op_kind {
-                                                CashOpKind::Payment => data.record_payment(
-                                                    date,
-                                                    "14:20",
-                                                    pid,
-                                                    op_cents,
-                                                    token,
-                                                    &mut this.cash_processed_tokens,
-                                                ),
-                                                CashOpKind::Tickets => data.record_ticket_credit(
-                                                    date,
-                                                    "14:20",
-                                                    pid,
-                                                    ticket_count,
-                                                    token,
-                                                    &mut this.cash_processed_tokens,
-                                                ),
-                                                CashOpKind::Discount => data.record_discount(
-                                                    date,
-                                                    "14:20",
-                                                    pid,
-                                                    op_cents,
-                                                    &reason_val,
-                                                    token,
-                                                    &mut this.cash_processed_tokens,
-                                                ),
-                                            },
+                                            DataStatus::Ready(data) => {
+                                                let mov_res = match op_kind {
+                                                    CashOpKind::Payment => data.record_payment(
+                                                        date,
+                                                        "14:20",
+                                                        pid,
+                                                        op_cents,
+                                                        token,
+                                                        &mut this.cash_processed_tokens,
+                                                    ),
+                                                    CashOpKind::Tickets => data.record_ticket_credit(
+                                                        date,
+                                                        "14:20",
+                                                        pid,
+                                                        ticket_count,
+                                                        token,
+                                                        &mut this.cash_processed_tokens,
+                                                    ),
+                                                    CashOpKind::Discount => data.record_discount(
+                                                        date,
+                                                        "14:20",
+                                                        pid,
+                                                        op_cents,
+                                                        &reason_val,
+                                                        token,
+                                                        &mut this.cash_processed_tokens,
+                                                    ),
+                                                };
+                                                if let Ok(ref mov_id) = mov_res {
+                                                    data.set_movement_operator(mov_id, &operator);
+                                                }
+                                                mov_res
+                                            }
                                             _ => Err("Los datos no están disponibles.".into()),
                                         };
                                         this.cash_submitting = false;
@@ -628,6 +673,102 @@ impl DesktopApp {
                 )
         });
     }
+
+    pub fn open_receipt_preview_dialog(
+        &self,
+        mov_id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let DataStatus::Ready(data) = &self.state.data else {
+            return;
+        };
+        let Some(mov) = data
+            .cash_register
+            .movements
+            .iter()
+            .find(|m| m.id == mov_id)
+            .cloned()
+        else {
+            return;
+        };
+        let person_label = mov
+            .pensioner_id
+            .and_then(|pid| data.pensioners.iter().find(|p| p.id == pid))
+            .map(|p| format!("{} (ID #{})", p.name(), p.id))
+            .unwrap_or_else(|| "Operación de caja".to_string());
+        let remaining_balance = mov.pensioner_id.map(|pid| data.balance(pid));
+        let dining_hall = self.preferences.dining_hall_name.clone();
+
+        window.open_dialog(cx, move |dialog, _, cx| {
+            let hall = dining_hall.clone();
+            let person = person_label.clone();
+            let mov_item = mov.clone();
+            dialog
+                .width(px(420.))
+                .title(format!("Comprobante simulado · {}", mov_item.id))
+                .child(
+                    v_flex()
+                        .gap_2p5()
+                        .p_3()
+                        .rounded(cx.theme().radius)
+                        .border_1()
+                        .border_color(cx.theme().border)
+                        .bg(cx.theme().muted)
+                        .child(
+                            div()
+                                .text_sm()
+                                .font_weight(FontWeight::BOLD)
+                                .child(hall),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(format!(
+                                    "Comprobante {} · {} {} · Responsable: {}",
+                                    mov_item.id,
+                                    mov_item.date.format("%d/%m/%Y"),
+                                    mov_item.time,
+                                    mov_item.operator_name
+                                )),
+                        )
+                        .child(div().text_xs().child(format!("Titular: {person}")))
+                        .child(div().text_xs().child(format!("Concepto: {}", mov_item.description)))
+                        .child(
+                            h_flex()
+                                .justify_between()
+                                .pt_1()
+                                .border_t_1()
+                                .border_color(cx.theme().border)
+                                .child(div().text_xs().font_weight(FontWeight::SEMIBOLD).child("Importe:"))
+                                .child(div().text_sm().font_weight(FontWeight::BOLD).child(amount(mov_item.cents))),
+                        )
+                        .when_some(remaining_balance, |this, bal| {
+                            this.child(
+                                div()
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(if bal < 0 {
+                                        format!("Saldo actual: A favor {}", amount(-bal))
+                                    } else {
+                                        format!("Saldo pendiente actual: {}", amount(bal))
+                                    }),
+                            )
+                        }),
+                )
+                .footer(
+                    h_flex()
+                        .justify_end()
+                        .child(
+                            Button::new("receipt-close")
+                                .primary()
+                                .label("Cerrar")
+                                .on_click(|_, window, cx| window.close_dialog(cx)),
+                        ),
+                )
+        });
+    }
 }
 
 fn kpi_box(label: &'static str, value: String, app: &App) -> impl IntoElement {
@@ -669,8 +810,10 @@ pub fn render(
     let total_debt: i64 = data.pensioners.iter().map(|p| data.balance(p.id)).sum();
     let expected_cash = data.cash_register.opening_cents + data.cash_inflow_cents();
 
-    let query = app_view.cash_search.read(app).value().trim().to_lowercase();
-    let filtered_pensioners: Vec<_> = data
+    let query = crate::pages::identification::normalize_search_text(
+        &app_view.cash_search.read(app).value(),
+    );
+    let mut filtered_pensioners: Vec<_> = data
         .pensioners
         .iter()
         .filter(|p| {
@@ -678,18 +821,24 @@ pub fn render(
             let matches_filter = match app_view.cash_filter {
                 CashFilter::All => true,
                 CashFilter::WithDebt => bal > 0,
-                CashFilter::Settled => bal == 0,
+                CashFilter::Settled => bal <= 0,
             };
             let matches_query = if query.is_empty() {
                 true
             } else {
-                format!("{} {} {}", p.id, p.name(), p.phone.as_deref().unwrap_or(""))
-                    .to_lowercase()
-                    .contains(&query)
+                let haystack = crate::pages::identification::normalize_search_text(&format!(
+                    "#{} {} {} {}",
+                    p.id,
+                    p.id,
+                    p.name(),
+                    p.phone.as_deref().unwrap_or("")
+                ));
+                query.split_whitespace().all(|tok| haystack.contains(tok))
             };
             matches_filter && matches_query
         })
         .collect();
+    filtered_pensioners.sort_by_key(|p| (std::cmp::Reverse(data.balance(p.id)), p.id));
 
     let selected_person = app_view
         .cash_selected_pensioner
@@ -848,6 +997,8 @@ pub fn render(
                                                         .gap_2()
                                                         .child(if bal > 0 {
                                                             Tag::warning().small().child(amount(bal))
+                                                        } else if bal < 0 {
+                                                            Tag::info().small().child(format!("A favor {}", amount(-bal)))
                                                         } else {
                                                             Tag::success().outline().small().child("S/ 0.00")
                                                         })
@@ -1144,6 +1295,7 @@ pub fn render(
                     v_flex()
                         .gap_2()
                         .children(data.cash_register.movements.iter().rev().take(12).map(|m| {
+                            let mov_id_btn = m.id.clone();
                             h_flex()
                                 .justify_between()
                                 .gap_3()
@@ -1157,17 +1309,37 @@ pub fn render(
                                         .child(Tag::secondary().small().child(m.id.clone()))
                                         .child(movement_tag(m.kind))
                                         .child(div().text_xs().child(format!(
-                                            "{} {} · {}",
+                                            "{} {} · {} · Por: {}",
                                             m.date.format("%d/%m/%Y"),
                                             m.time,
-                                            m.description
+                                            m.description,
+                                            m.operator_name
                                         ))),
                                 )
                                 .child(
-                                    div()
-                                        .text_xs()
-                                        .font_weight(FontWeight::SEMIBOLD)
-                                        .child(amount(m.cents)),
+                                    h_flex()
+                                        .gap_2()
+                                        .items_center()
+                                        .child(
+                                            div()
+                                                .text_xs()
+                                                .font_weight(FontWeight::SEMIBOLD)
+                                                .child(amount(m.cents)),
+                                        )
+                                        .child(
+                                            Button::new(format!("cash-receipt-{}", m.id))
+                                                .ghost()
+                                                .xsmall()
+                                                .icon(LucideIcon::FileText)
+                                                .tooltip("Ver comprobante simulado")
+                                                .on_click(cx.listener(move |this, _, window, cx| {
+                                                    this.open_receipt_preview_dialog(
+                                                        &mov_id_btn,
+                                                        window,
+                                                        cx,
+                                                    );
+                                                })),
+                                        ),
                                 )
                         }))
                         .into_any_element()

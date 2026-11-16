@@ -197,6 +197,9 @@ pub struct PeriodSummaryRow {
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct ReportTotals {
+    pub breakfast_attentions: usize,
+    pub lunch_attentions: usize,
+    pub total_attentions: usize,
     pub breakfast_portions: u32,
     pub economic_lunch_portions: u32,
     pub special_portions: u32,
@@ -318,6 +321,12 @@ impl ReportsDataSource for MockReportsDataSource<'_> {
             let is_breakfast = c.meal == Meal::Breakfast;
             let is_special = c.menu_kind == MenuKind::Special;
 
+            totals.total_attentions += 1;
+            if is_breakfast {
+                totals.breakfast_attentions += 1;
+            } else {
+                totals.lunch_attentions += 1;
+            }
             totals.total_portions += c.portions;
             totals.total_consumed_cents += c.cents;
             if c.picked_up_by.is_some() {
@@ -529,5 +538,71 @@ mod tests {
         });
         assert_eq!(special_only.consumptions.len(), 1);
         assert_eq!(special_only.totals.special_portions, 2);
+    }
+
+    #[test]
+    fn dashboard_cash_and_reports_stay_consistent_after_mutations() {
+        let today = NaiveDate::from_ymd_opt(2026, 1, 2).unwrap();
+        let mut data = MockData::demo(today);
+        let mut c_tokens = HashSet::new();
+        let mut p_tokens = HashSet::new();
+
+        // 1. Registrar nuevo pensionista
+        let new_pid = data
+            .save_pensioner(None, "Sofía", "Mendoza", "987654321")
+            .unwrap();
+
+        // 2. Registrar consumo con 3 raciones en 1 atención de desayuno
+        data.record_consumptions(
+            today,
+            "08:45",
+            new_pid,
+            &[DraftConsumptionItem {
+                id: 1,
+                meal: Meal::Breakfast,
+                menu_kind: MenuKind::Economic,
+                description: "Desayuno".into(),
+                portions: 3,
+                unit_price_cents: 500,
+            }],
+            None,
+            10,
+            &mut c_tokens,
+        )
+        .unwrap();
+
+        // 3. Registrar pago parcial en Caja
+        data.record_payment(today, "09:00", new_pid, 500, 10, &mut p_tokens)
+            .unwrap();
+
+        // Dashboard (fecha hoy)
+        let dash = data.summary(today);
+        assert_eq!(dash.registered, 5);
+        assert_eq!(dash.active, 4);
+        // 2 desayunos demo + 1 atención nueva = 3 atenciones de desayuno; 3 + 3 = 6 raciones
+        assert_eq!(dash.breakfasts, 3);
+        assert_eq!(dash.breakfast_portions, 6);
+        assert_eq!(dash.attentions(), 5);
+        assert_eq!(dash.portions, 9);
+
+        // Caja: suma de saldos por pensionista
+        let cash_total_debt: i64 = data.pensioners.iter().map(|p| data.balance(p.id)).sum();
+        assert_eq!(dash.debt_cents, cash_total_debt);
+
+        // Reportes con filtro Hoy
+        let (date_from, date_to) = DateRangePreset::Today.bounds(today);
+        let snap_today = MockReportsDataSource::new(&data).query_reports(&ReportQueryFilter {
+            date_from,
+            date_to,
+            ..Default::default()
+        });
+
+        assert_eq!(snap_today.totals.total_attentions, dash.attentions());
+        assert_eq!(snap_today.totals.breakfast_attentions, dash.breakfasts);
+        assert_eq!(snap_today.totals.lunch_attentions, dash.lunches);
+        assert_eq!(snap_today.totals.total_portions, dash.portions);
+        assert_eq!(snap_today.totals.total_consumed_cents, dash.consumed_cents);
+        assert_eq!(snap_today.totals.total_paid_cents, dash.paid_cents);
+        assert_eq!(snap_today.totals.total_debt_cents, cash_total_debt);
     }
 }

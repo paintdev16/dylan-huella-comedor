@@ -1,13 +1,19 @@
 use gpui_kit::{
     App, Context, FontWeight, IntoElement, ParentElement, Styled, div, px,
     assets::IconName,
-    component::{ActiveTheme as _, Icon, Sizable as _, button::{Button, ButtonVariants as _}, h_flex, v_flex, scroll::ScrollableElement as _},
+    component::{ActiveTheme as _, Icon, Sizable as _, button::{Button, ButtonVariants as _}, h_flex, scroll::ScrollableElement as _, spinner::Spinner, v_flex},
 };
 use crate::{layout::DesktopApp, mock_data::DashboardSummary, state::{AppState, DataStatus}};
 
 fn money(cents: i64) -> String { format!("S/ {}.{:02}", cents / 100, cents.abs() % 100) }
 
-fn card(title: &'static str, value: String, detail: &'static str, icon: IconName, cx: &App) -> impl IntoElement {
+fn card(
+    title: &'static str,
+    value: String,
+    detail: impl Into<gpui_kit::SharedString>,
+    icon: IconName,
+    cx: &App,
+) -> impl IntoElement {
     let theme = cx.theme();
     v_flex().flex_1().min_w(px(200.)).gap_3().p_4().rounded(theme.radius_lg)
         .bg(theme.colors.list).border_1().border_color(theme.border)
@@ -15,7 +21,7 @@ fn card(title: &'static str, value: String, detail: &'static str, icon: IconName
             .child(div().text_sm().text_color(theme.muted_foreground).child(title))
             .child(Icon::new(icon).size_4().text_color(theme.primary)))
         .child(div().text_2xl().font_weight(FontWeight::BOLD).child(value))
-        .child(div().text_xs().text_color(theme.muted_foreground).child(detail))
+        .child(div().text_xs().text_color(theme.muted_foreground).child(detail.into()))
 }
 
 fn cell(text: impl Into<gpui_kit::SharedString>, width: f32) -> impl IntoElement {
@@ -53,7 +59,18 @@ pub fn render(state: &AppState, cx: &Context<DesktopApp>, app_cx: &App) -> impl 
     let theme = app_cx.theme();
     let date = state.dashboard_date;
     let body = match &state.data {
-        DataStatus::Loading => div().p_6().text_color(theme.muted_foreground).child("Cargando datos del dashboard…").into_any_element(),
+        DataStatus::Loading => h_flex()
+            .gap_3()
+            .items_center()
+            .p_6()
+            .rounded(theme.radius_lg)
+            .border_1()
+            .border_color(theme.border)
+            .bg(theme.colors.list)
+            .text_color(theme.muted_foreground)
+            .child(Spinner::new().small())
+            .child("Cargando datos del dashboard…")
+            .into_any_element(),
         DataStatus::Error(message) => v_flex().gap_3().p_6()
             .child(div().text_color(theme.danger).child(format!("No se pudieron cargar los datos: {message}")))
             .child(Button::new("dashboard-retry").outline().label("Reintentar")
@@ -66,10 +83,10 @@ pub fn render(state: &AppState, cx: &Context<DesktopApp>, app_cx: &App) -> impl 
                 .child(h_flex().gap_4().flex_wrap()
                     .child(card("Pensionistas registrados", summary.registered.to_string(), "Total actual", IconName::Users, app_cx))
                     .child(card("Pensionistas activos", summary.active.to_string(), "Estado actual", IconName::Users, app_cx))
-                    .child(card("Desayunos", summary.breakfasts.to_string(), "Consumos registrados", IconName::Utensils, app_cx))
-                    .child(card("Almuerzos", summary.lunches.to_string(), "Consumos registrados", IconName::Utensils, app_cx)))
+                    .child(card("Desayunos", summary.breakfasts.to_string(), format!("Atenciones · {} ración(es)", summary.breakfast_portions), IconName::Utensils, app_cx))
+                    .child(card("Almuerzos", summary.lunches.to_string(), format!("Atenciones · {} ración(es)", summary.lunch_portions), IconName::Utensils, app_cx)))
                 .child(h_flex().gap_4().flex_wrap()
-                    .child(card("Raciones entregadas", summary.portions.to_string(), "Unidades entregadas", IconName::Utensils, app_cx))
+                    .child(card("Raciones entregadas", summary.portions.to_string(), format!("En {} atención(es) del día", summary.attentions()), IconName::Utensils, app_cx))
                     .child(card("Importe consumido", money(summary.consumed_cents), "Consumos de la fecha", IconName::Wallet, app_cx))
                     .child(card("Pagos recibidos", money(summary.paid_cents), "Pagos de la fecha", IconName::Wallet, app_cx))
                     .child(card("Deuda pendiente", money(summary.debt_cents), "Acumulada hasta la fecha", IconName::Wallet, app_cx)))

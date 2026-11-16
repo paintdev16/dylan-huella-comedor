@@ -23,12 +23,13 @@ use gpui_kit::assets::IconName as LucideIcon;
 
 use crate::{
     auth::{AuthError, AuthService, AuthStatus, MockAuthService},
-    biometric_service::{BiometricGateway as _, SimulatedBiometricGateway},
+    biometric_service::{BiometricGateway, SimulatedBiometricGateway},
     components::{common, sidebar},
     login, mock_data, pages::{self, identification::{GlobalPensionerChoice, build_global_pensioner_choices}}, services,
     settings_store::{
         AppPreferences, BiometricBackupStatus, OsCredentialVaultPlaceholder,
-        ServerConnectionStatus, ThemePreference, default_preferences_path, load_preferences_from,
+        ServerConnectionStatus, ThemePreference, default_preferences_path, format_time_minutes,
+        load_preferences_from,
     },
     state::{AppState, DataStatus, Page, ServiceStatus},
     theme,
@@ -64,7 +65,7 @@ pub struct DesktopApp {
     pub(crate) pensioner_filter: crate::pages::pensioners::Filter,
     pub(crate) selected_pensioner: Option<u32>,
     _search_subscription: Subscription,
-    pub(crate) biometric_gateway: SimulatedBiometricGateway,
+    pub(crate) biometric_gateway: Box<dyn BiometricGateway>,
     pub(crate) biometric_event_log: Vec<SharedString>,
     pub(crate) biometric_task: Option<Task<()>>,
     pub(crate) biometric_op_id: u64,
@@ -76,6 +77,8 @@ pub struct DesktopApp {
     pub(crate) global_pensioner_combobox: Entity<ComboboxState<SearchableVec<GlobalPensionerChoice>>>,
     pub(crate) global_search_last_items: Vec<GlobalPensionerChoice>,
     pub(crate) pending_global_search_clear: bool,
+    pub(crate) pending_global_search_focus: bool,
+    pub(crate) global_search_opened_modal: bool,
     _global_search_subscription: Subscription,
     pub(crate) consumption_pricing: mock_data::ConsumptionPricing,
     pub(crate) consumption_confirm_token: u64,
@@ -114,6 +117,10 @@ pub struct DesktopApp {
     pub(crate) cfg_lunch_input: Entity<InputState>,
     pub(crate) cfg_special_input: Entity<InputState>,
     pub(crate) cfg_ticket_input: Entity<InputState>,
+    pub(crate) cfg_breakfast_start_input: Entity<InputState>,
+    pub(crate) cfg_breakfast_end_input: Entity<InputState>,
+    pub(crate) cfg_lunch_start_input: Entity<InputState>,
+    pub(crate) cfg_lunch_end_input: Entity<InputState>,
     pub(crate) cfg_server_url_input: Entity<InputState>,
     pub(crate) cfg_station_id_input: Entity<InputState>,
 }
@@ -121,9 +128,17 @@ pub struct DesktopApp {
 impl DesktopApp {
     pub fn focus_global_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if !self.state.auth.user().is_some_and(|u| u.can("consumptions.create"))
-            || self.biometric_modal_open || window.has_active_dialog(cx) { return; }
+            || self.biometric_modal_open
+            || window.has_active_dialog(cx)
+        {
+            return;
+        }
         self.global_pensioner_combobox.update(cx, |cb, cx| cb.focus(window, cx));
         let focus = self.global_pensioner_combobox.read(cx).focus_handle(cx);
+        if !focus.is_focused(window) {
+            focus.focus(window, cx);
+            return;
+        }
         window.defer(cx, move |window, cx| {
             if focus.is_focused(window) && !window.has_active_dialog(cx) {
                 window.dispatch_action(Box::new(gpui_kit::base::actions::SelectDown), cx);
@@ -151,10 +166,15 @@ impl DesktopApp {
         let global_search_sub = cx.subscribe_in(
             &global_pensioner_combobox,
             window,
-            |this, _, event: &ComboboxEvent<SearchableVec<GlobalPensionerChoice>>, window, cx| {
+            |this, cb, event: &ComboboxEvent<SearchableVec<GlobalPensionerChoice>>, window, cx| {
                 if let ComboboxEvent::Confirm(values) = event {
+                    this.pending_global_search_clear = true;
                     if let Some(&pensioner_id) = values.first() {
-                        this.open_manual_consumption_modal(pensioner_id, window, cx);
+                        if this.open_manual_consumption_modal(pensioner_id, window, cx) {
+                            this.global_search_opened_modal = true;
+                        }
+                    } else if !cb.read(cx).query(cx).is_empty() {
+                        cx.notify();
                     }
                 }
             },
@@ -211,6 +231,26 @@ impl DesktopApp {
                 preferences.ticket_value_cents.abs() % 100
             ))
         });
+        let cfg_breakfast_start_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("06:00")
+                .default_value(format_time_minutes(preferences.breakfast_start_minutes))
+        });
+        let cfg_breakfast_end_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("11:00")
+                .default_value(format_time_minutes(preferences.breakfast_end_minutes))
+        });
+        let cfg_lunch_start_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("11:00")
+                .default_value(format_time_minutes(preferences.lunch_start_minutes))
+        });
+        let cfg_lunch_end_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("16:00")
+                .default_value(format_time_minutes(preferences.lunch_end_minutes))
+        });
         let cfg_server_url_input = cx.new(|cx| {
             InputState::new(window, cx)
                 .placeholder("http://127.0.0.1:8080")
@@ -250,7 +290,7 @@ impl DesktopApp {
             pensioner_filter: crate::pages::pensioners::Filter::All,
             selected_pensioner: None,
             _search_subscription: search_subscription,
-            biometric_gateway: SimulatedBiometricGateway::new(),
+            biometric_gateway: Box::new(SimulatedBiometricGateway::new()),
             biometric_event_log: Vec::new(),
             biometric_task: None,
             biometric_op_id: 0,
@@ -262,6 +302,8 @@ impl DesktopApp {
             global_pensioner_combobox,
             global_search_last_items: Vec::new(),
             pending_global_search_clear: false,
+            pending_global_search_focus: false,
+            global_search_opened_modal: false,
             _global_search_subscription: global_search_sub,
             consumption_pricing,
             consumption_confirm_token: 1,
@@ -269,7 +311,7 @@ impl DesktopApp {
             cash_search,
             cash_amount_input,
             cash_discount_reason_input,
-            cash_filter: crate::pages::cash::CashFilter::All,
+            cash_filter: crate::pages::cash::CashFilter::WithDebt,
             cash_op_kind: crate::pages::cash::CashOpKind::Payment,
             cash_selected_pensioner: None,
             cash_ticket_count: 1,
@@ -300,6 +342,10 @@ impl DesktopApp {
             cfg_lunch_input,
             cfg_special_input,
             cfg_ticket_input,
+            cfg_breakfast_start_input,
+            cfg_breakfast_end_input,
+            cfg_lunch_start_input,
+            cfg_lunch_end_input,
             cfg_server_url_input,
             cfg_station_id_input,
         };
@@ -382,6 +428,8 @@ impl DesktopApp {
         self.pending_auto_modal_pensioner = None;
         self.pending_biometric_notice = None;
         self.pending_global_search_clear = true;
+        self.pending_global_search_focus = false;
+        self.global_search_opened_modal = false;
         self.biometric_gateway.disconnect();
         self.biometric_event_log.clear();
         self.state.auth = AuthStatus::Unauthenticated;
@@ -568,15 +616,21 @@ impl Render for DesktopApp {
                 );
             });
         }
-        if self.pending_global_search_clear {
-            self.pending_global_search_clear = false;
+        if self.pending_global_search_clear || self.pending_global_search_focus {
+            let do_clear = std::mem::take(&mut self.pending_global_search_clear);
+            let do_focus = std::mem::take(&mut self.pending_global_search_focus);
             let entity = cx.entity().downgrade();
             window.defer(cx, move |window, cx| {
                 let _ = entity.update(cx, |app, cx| {
                     app.global_pensioner_combobox.update(cx, |cb, cx| {
-                        cb.clear_selection(cx);
-                        cb.set_query("", window, cx);
-                        if !window.has_active_dialog(cx) && app.state.auth.user().is_some_and(|u| u.can("consumptions.create")) {
+                        if do_clear {
+                            cb.clear_selection(cx);
+                            cb.set_query("", window, cx);
+                        }
+                        if do_focus
+                            && !window.has_active_dialog(cx)
+                            && app.state.auth.user().is_some_and(|u| u.can("consumptions.create"))
+                        {
                             cb.focus(window, cx);
                         }
                     });
@@ -761,10 +815,19 @@ impl Render for DesktopApp {
                                             .xsmall()
                                             .icon(LucideIcon::Search)
                                             .placeholder("Buscar pensionista (Ctrl+K)")
-                                            .search_placeholder("Nombre, #ID o celular…")
+                                            .search_placeholder("Nombre, apellido, celular o #ID…")
                                             .menu_width(px(360.))
                                             .cleanable(true)
-                                            .disabled(self.biometric_modal_open),
+                                            .disabled(self.biometric_modal_open)
+                                            .empty(|_, cx| {
+                                                gpui_kit::div()
+                                                    .py_4()
+                                                    .px_3()
+                                                    .text_xs()
+                                                    .text_center()
+                                                    .text_color(cx.theme().muted_foreground)
+                                                    .child("Sin pensionistas activos que coincidan.")
+                                            }),
                                     ),
                             )
                         })
