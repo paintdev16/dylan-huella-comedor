@@ -567,19 +567,332 @@ impl DesktopApp {
         });
     }
 
-    fn confirm_change(
+    fn open_biometric_enroll_modal(
         &mut self,
         id: u32,
-        biometric: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let permission = if biometric {
-            "biometrics.enroll"
-        } else {
-            "pensioners.update"
+        if !self.has_pensioner_permission("biometrics.enroll") {
+            window.push_notification(
+                Notification::error("No tienes permiso para registrar o gestionar huellas."),
+                cx,
+            );
+            return;
+        }
+        let Some(person) = (match &self.state.data {
+            DataStatus::Ready(data) => data.pensioners.iter().find(|p| p.id == id).cloned(),
+            _ => None,
+        }) else {
+            window.push_notification(Notification::error("Pensionista no encontrado."), cx);
+            return;
         };
-        if !self.has_pensioner_permission(permission) {
+        if !person.active {
+            window.push_notification(
+                Notification::error("Activa al pensionista antes de gestionar su huella."),
+                cx,
+            );
+            return;
+        }
+
+        let reader_connected = self.biometric_gateway.state().is_connected();
+        if reader_connected {
+            self.biometric_modal_open = true;
+            self.biometric_gateway.set_modal_locked(true);
+        }
+
+        let already_registered = person.fingerprint_registered;
+        let existing_bio_id = person.biometric_id.clone();
+        let name = person.name();
+
+        let modal_state = cx.new(|_| NewEnrollFormState {
+            enabled: reader_connected,
+            consent_given: true,
+            step: if reader_connected {
+                EnrollmentStep::WaitingFinger
+            } else {
+                EnrollmentStep::Error(
+                    "Lector biométrico desconectado. Conecta el lector para iniciar la captura."
+                        .into(),
+                )
+            },
+            op_seq: 0,
+        });
+
+        let app = cx.entity().downgrade();
+        let app_cancel_dlg = app.clone();
+        let app_cancel_btn = app.clone();
+        let app_cap = app.clone();
+        let app_save = app.clone();
+
+        window.open_dialog(cx, move |dialog, _, cx| {
+            let st = modal_state.read(cx).clone();
+            let is_busy = matches!(
+                st.step,
+                EnrollmentStep::Capturing | EnrollmentStep::Verifying
+            );
+            let modal_cap = modal_state.clone();
+            let modal_err = modal_state.clone();
+            let modal_save = modal_state.clone();
+            let app_cap_cb = app_cap.clone();
+            let app_save_cb = app_save.clone();
+            let app_dlg_close = app_cancel_dlg.clone();
+            let app_btn_close = app_cancel_btn.clone();
+
+            let captured_id = match &st.step {
+                EnrollmentStep::Registered { biometric_id } => Some(biometric_id.clone()),
+                _ => None,
+            };
+
+            dialog
+                .width(px(480.))
+                .title(if already_registered {
+                    format!("Gestionar huella · {name}")
+                } else {
+                    format!("Registrar huella · {name}")
+                })
+                .on_cancel(move |_, _, cx| {
+                    let _ = app_dlg_close.update(cx, |this, cx| {
+                        this.resume_waiting_after_modal(cx);
+                    });
+                    true
+                })
+                .child(
+                    v_flex()
+                        .gap_3()
+                        .child(
+                            h_flex()
+                                .justify_between()
+                                .p_2p5()
+                                .rounded(cx.theme().radius)
+                                .border_1()
+                                .border_color(cx.theme().border)
+                                .bg(cx.theme().muted)
+                                .child(
+                                    v_flex()
+                                        .gap_0p5()
+                                        .child(
+                                            div()
+                                                .text_sm()
+                                                .font_weight(FontWeight::SEMIBOLD)
+                                                .child(format!("Pensionista #{id} · {name}")),
+                                        )
+                                        .child(
+                                            div()
+                                                .text_xs()
+                                                .text_color(cx.theme().muted_foreground)
+                                                .child(if let Some(bio) = &existing_bio_id {
+                                                    format!("Plantilla actual: {bio}")
+                                                } else {
+                                                    "Estado actual: Pendiente de enrolamiento"
+                                                        .to_string()
+                                                }),
+                                        ),
+                                )
+                                .child(enrollment_tag(&st.step)),
+                        )
+                        .when_some(
+                            match &st.step {
+                                EnrollmentStep::Error(msg) => Some(msg.clone()),
+                                _ => None,
+                            },
+                            |this, msg| this.child(Alert::error("bio-modal-err", msg)),
+                        )
+                        .child(
+                            h_flex()
+                                .gap_3()
+                                .p_3()
+                                .rounded(cx.theme().radius)
+                                .border_1()
+                                .border_color(cx.theme().border)
+                                .child(if is_busy {
+                                    Spinner::new().small().into_any_element()
+                                } else {
+                                    Icon::new(LucideIcon::FingerprintPattern)
+                                        .size_6()
+                                        .text_color(cx.theme().primary)
+                                        .into_any_element()
+                                })
+                                .child(
+                                    v_flex()
+                                        .gap_0p5()
+                                        .child(
+                                            div()
+                                                .text_sm()
+                                                .font_weight(FontWeight::MEDIUM)
+                                                .child(st.step.label()),
+                                        )
+                                        .child(
+                                            div()
+                                                .text_xs()
+                                                .text_color(cx.theme().muted_foreground)
+                                                .child(if let Some(bio) = &captured_id {
+                                                    format!("Identificador único generado: {bio} (simulación sin lector real).")
+                                                } else {
+                                                    "Identificación de consumos suspendida mientras este modal permanezca abierto.".to_string()
+                                                }),
+                                        ),
+                                ),
+                        )
+                        .child(
+                            h_flex()
+                                .gap_2()
+                                .child(
+                                    Button::new("modal-enroll-capture")
+                                        .outline()
+                                        .small()
+                                        .disabled(!reader_connected || is_busy)
+                                        .icon(LucideIcon::FingerprintPattern)
+                                        .label(if already_registered {
+                                            "Recapturar huella"
+                                        } else {
+                                            "Simular captura"
+                                        })
+                                        .on_click(move |_, _, cx| {
+                                            let seq = modal_cap.update(cx, |s, cx| {
+                                                s.op_seq = s.op_seq.wrapping_add(1);
+                                                s.step = EnrollmentStep::Capturing;
+                                                cx.notify();
+                                                s.op_seq
+                                            });
+                                            let weak_modal = modal_cap.downgrade();
+                                            let app_ref = app_cap_cb.clone();
+                                            cx.spawn(async move |cx| {
+                                                cx.background_spawn(async move {
+                                                    std::thread::sleep(Duration::from_millis(200));
+                                                })
+                                                .await;
+                                                let ok = weak_modal
+                                                    .update(cx, |s, cx| {
+                                                        if s.op_seq != seq {
+                                                            return false;
+                                                        }
+                                                        s.step = EnrollmentStep::Verifying;
+                                                        cx.notify();
+                                                        true
+                                                    })
+                                                    .unwrap_or(false);
+                                                if !ok {
+                                                    return;
+                                                }
+                                                cx.background_spawn(async move {
+                                                    std::thread::sleep(Duration::from_millis(220));
+                                                })
+                                                .await;
+                                                let candidates = app_ref
+                                                    .read_with(cx, |app, _| match &app.state.data {
+                                                        DataStatus::Ready(d) => {
+                                                            d.biometric_candidates()
+                                                        }
+                                                        _ => Vec::new(),
+                                                    })
+                                                    .unwrap_or_default();
+                                                let generated =
+                                                    generate_unique_biometric_id(&candidates);
+                                                let _ = weak_modal.update(cx, |s, cx| {
+                                                    if s.op_seq != seq {
+                                                        return;
+                                                    }
+                                                    s.step = EnrollmentStep::Registered {
+                                                        biometric_id: generated,
+                                                    };
+                                                    cx.notify();
+                                                });
+                                            })
+                                            .detach();
+                                        }),
+                                )
+                                .child(
+                                    Button::new("modal-enroll-error")
+                                        .ghost()
+                                        .small()
+                                        .disabled(!reader_connected || is_busy)
+                                        .label("Simular error")
+                                        .on_click(move |_, _, cx| {
+                                            modal_err.update(cx, |s, cx| {
+                                                s.op_seq = s.op_seq.wrapping_add(1);
+                                                s.step = EnrollmentStep::Error(
+                                                    "Lectura simulada incompleta. Reintenta la captura."
+                                                        .into(),
+                                                );
+                                                cx.notify();
+                                            });
+                                        }),
+                                ),
+                        ),
+                )
+                .footer(
+                    h_flex()
+                        .gap_3()
+                        .justify_end()
+                        .child(
+                            Button::new("bio-modal-cancel")
+                                .outline()
+                                .label("Cancelar")
+                                .on_click(move |_, window, cx| {
+                                    let _ = app_btn_close.update(cx, |this, cx| {
+                                        this.resume_waiting_after_modal(cx);
+                                    });
+                                    window.close_dialog(cx);
+                                }),
+                        )
+                        .child(
+                            Button::new("bio-modal-save")
+                                .primary()
+                                .disabled(captured_id.is_none() || is_busy)
+                                .label("Confirmar registro")
+                                .on_click(move |_, window, cx| {
+                                    let bio_code = match &modal_save.read(cx).step {
+                                        EnrollmentStep::Registered { biometric_id } => {
+                                            biometric_id.clone()
+                                        }
+                                        _ => return,
+                                    };
+                                    let res = app_save_cb.update(cx, |this, cx| {
+                                        let DataStatus::Ready(data) = &mut this.state.data else {
+                                            return Err(
+                                                "Los datos no están disponibles.".to_string(),
+                                            );
+                                        };
+                                        let registered =
+                                            data.register_fingerprint_with_id(id, &bio_code)?;
+                                        this.push_biometric_event(BiometricEvent::Enrolled {
+                                            pensioner_id: id,
+                                            biometric_id: registered,
+                                        });
+                                        this.resume_waiting_after_modal(cx);
+                                        Ok(())
+                                    });
+                                    match res {
+                                        Ok(Ok(())) => {
+                                            window.close_dialog(cx);
+                                            window.push_notification(
+                                                Notification::success(
+                                                    "Huella simulada asociada correctamente.",
+                                                ),
+                                                cx,
+                                            );
+                                        }
+                                        Ok(Err(err)) => {
+                                            window.push_notification(Notification::error(err), cx);
+                                        }
+                                        Err(_) => {
+                                            window.close_dialog(cx);
+                                        }
+                                    }
+                                }),
+                        ),
+                )
+        });
+    }
+
+    fn confirm_change(
+        &mut self,
+        id: u32,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.has_pensioner_permission("pensioners.update") {
             window.push_notification(
                 Notification::error("No tienes permiso para realizar esta acción."),
                 cx,
@@ -593,100 +906,18 @@ impl DesktopApp {
             window.push_notification(Notification::error("Pensionista no encontrado."), cx);
             return;
         };
-        if biometric && !person.active {
-            window.push_notification(
-                Notification::error("Activa al pensionista antes de registrar la huella."),
-                cx,
-            );
-            return;
-        }
         let was_active = person.active;
         let name = person.name();
-        let suggested_bio = person
-            .biometric_id
-            .clone()
-            .unwrap_or_else(|| format!("BIO-{id:04}"));
-        let bio_input = cx.new(|cx| {
-            InputState::new(window, cx)
-                .placeholder("Ej. BIO-0001")
-                .default_value(suggested_bio)
-        });
-        let dialog_error: Entity<Option<String>> = cx.new(|_| None);
         let app = cx.entity().downgrade();
-        let description = if biometric {
-            format!(
-                "Simulación para {name} (ID #{id}). No se captura ni almacena ninguna huella."
-            )
-        } else {
-            format!(
-                "¿Deseas {} a {name} (ID #{id})?",
-                if was_active { "desactivar" } else { "activar" }
-            )
-        };
-        window.open_dialog(cx, move |dialog, _, cx| {
+        let description = format!(
+            "¿Deseas {} a {name} (ID #{id})?",
+            if was_active { "desactivar" } else { "activar" }
+        );
+        window.open_dialog(cx, move |dialog, _, _| {
             let app = app.clone();
-            let bio_field = bio_input.clone();
-            let bio_field_submit = bio_input.clone();
-            let err_view = dialog_error.clone();
-            let err_submit = dialog_error.clone();
-            let current_err = err_view.read(cx).clone();
             dialog
-                .title(if biometric {
-                    "Registrar huella (simulado)"
-                } else {
-                    "Confirmar cambio de estado"
-                })
-                .child(
-                    v_flex()
-                        .gap_3()
-                        .when_some(current_err, |this, err| {
-                            this.child(Alert::error("biometric-enroll-error", err))
-                        })
-                        .when(biometric, |this| {
-                            this.child(
-                                h_flex()
-                                    .gap_3()
-                                    .p_3()
-                                    .rounded(cx.theme().radius)
-                                    .border_1()
-                                    .border_color(cx.theme().border)
-                                    .bg(cx.theme().muted)
-                                    .child(
-                                        Icon::new(LucideIcon::FingerprintPattern)
-                                            .size_6()
-                                            .text_color(cx.theme().primary),
-                                    )
-                                    .child(
-                                        v_flex()
-                                            .gap_0p5()
-                                            .child(
-                                                div()
-                                                    .text_sm()
-                                                    .font_weight(FontWeight::SEMIBOLD)
-                                                    .child("Lector biométrico simulado"),
-                                            )
-                                            .child(
-                                                div()
-                                                    .text_xs()
-                                                    .text_color(cx.theme().muted_foreground)
-                                                    .child("Al confirmar, se asociará un código de prueba al pensionista."),
-                                            ),
-                                    ),
-                            )
-                            .child(
-                                v_flex()
-                                    .gap_1p5()
-                                    .child(
-                                        div()
-                                            .text_sm()
-                                            .font_weight(FontWeight::MEDIUM)
-                                            .child("Código de simulación único *"),
-                                    )
-                                    .child(Input::new(&bio_field)),
-                            )
-                        })
-                        .child(div().text_sm().child(description.clone())),
-                )
+                .title("Confirmar cambio de estado")
+                .child(div().text_sm().child(description.clone()))
                 .footer(
                     h_flex()
                         .gap_3()
@@ -700,17 +931,10 @@ impl DesktopApp {
                         .child(
                             Button::new("confirm-apply")
                                 .primary()
-                                .label(if biometric {
-                                    "Simular registro"
-                                } else if was_active {
-                                    "Desactivar"
-                                } else {
-                                    "Activar"
-                                })
+                                .label(if was_active { "Desactivar" } else { "Activar" })
                                 .on_click(move |_, window, cx| {
-                                    let bio_code = bio_field_submit.read(cx).value().to_string();
                                     let result = app.update(cx, |this, cx| {
-                                        if !this.has_pensioner_permission(permission) {
+                                        if !this.has_pensioner_permission("pensioners.update") {
                                             return Err(
                                                 "No tienes permiso para realizar esta acción."
                                                     .to_string(),
@@ -721,48 +945,23 @@ impl DesktopApp {
                                                 "Los datos no están disponibles.".to_string(),
                                             );
                                         };
-                                        if biometric {
-                                            let registered =
-                                                data.register_fingerprint_with_id(id, &bio_code)?;
-                                            this.push_biometric_event(
-                                                crate::biometric_service::BiometricEvent::Enrolled {
-                                                    pensioner_id: id,
-                                                    biometric_id: registered,
-                                                },
-                                            );
-                                        } else {
-                                            data.set_active(id, was_active)
-                                                .map_err(|e| e.to_string())?;
-                                        }
+                                        data.set_active(id, was_active)
+                                            .map_err(|e| e.to_string())?;
                                         cx.notify();
                                         Ok(())
                                     });
                                     match result {
                                         Ok(Ok(())) => {
-                                            err_submit.update(cx, |err, _| *err = None);
                                             window.close_dialog(cx);
                                             window.push_notification(
-                                                Notification::success(if biometric {
-                                                    "Registro de huella simulado."
-                                                } else {
-                                                    "Estado actualizado."
-                                                }),
+                                                Notification::success("Estado actualizado."),
                                                 cx,
                                             );
                                         }
                                         Ok(Err(error)) => {
-                                            err_submit.update(cx, |err, cx| {
-                                                *err = Some(error.clone());
-                                                cx.notify();
-                                            });
                                             window.push_notification(Notification::error(error), cx);
                                         }
-                                        Err(_) => window.push_notification(
-                                            Notification::error(
-                                                "La pantalla ya no está disponible.",
-                                            ),
-                                            cx,
-                                        ),
+                                        Err(_) => window.close_dialog(cx),
                                     }
                                 }),
                         ),
@@ -881,51 +1080,6 @@ fn details(
                                     person.phone.as_deref().unwrap_or("No registrado")
                                 )),
                         ),
-                )
-                .child(
-                    h_flex()
-                        .gap_2()
-                        .flex_wrap()
-                        .when(allowed(state, "pensioners.update"), |this| {
-                            this.child(
-                                Button::new("edit-person")
-                                    .outline()
-                                    .small()
-                                    .icon(LucideIcon::Pencil)
-                                    .label("Editar")
-                                    .on_click(cx.listener(move |this, _, window, cx| {
-                                        this.pensioner_form(Some(id), window, cx)
-                                    })),
-                            )
-                        })
-                        .when(allowed(state, "pensioners.update"), |this| {
-                            this.child(
-                                Button::new("toggle-person")
-                                    .outline()
-                                    .small()
-                                    .icon(if active {
-                                        LucideIcon::UserX
-                                    } else {
-                                        LucideIcon::UserCheck
-                                    })
-                                    .label(if active { "Desactivar" } else { "Activar" })
-                                    .on_click(cx.listener(move |this, _, window, cx| {
-                                        this.confirm_change(id, false, window, cx)
-                                    })),
-                            )
-                        })
-                        .when(allowed(state, "biometrics.enroll") && active, |this| {
-                            this.child(
-                                Button::new("enroll-person")
-                                    .primary()
-                                    .small()
-                                    .icon(LucideIcon::FingerprintPattern)
-                                    .label("Registrar huella")
-                                    .on_click(cx.listener(move |this, _, window, cx| {
-                                        this.confirm_change(id, true, window, cx)
-                                    })),
-                            )
-                        }),
                 ),
         )
         .when(can_consumptions && can_payments, |this| {
@@ -1118,6 +1272,7 @@ pub fn render(
                                 })),
                         )
                         .when(allowed(state, "pensioners.update"), |this| {
+                            let is_active = person.active;
                             this.child(
                                 Button::new(format!("person-edit-{id}"))
                                     .ghost()
@@ -1126,6 +1281,45 @@ pub fn render(
                                     .tooltip("Editar")
                                     .on_click(cx.listener(move |this, _, window, cx| {
                                         this.pensioner_form(Some(id), window, cx)
+                                    })),
+                            )
+                            .child(
+                                Button::new(format!("person-toggle-{id}"))
+                                    .ghost()
+                                    .small()
+                                    .icon(if is_active {
+                                        LucideIcon::UserX
+                                    } else {
+                                        LucideIcon::UserCheck
+                                    })
+                                    .tooltip(if is_active {
+                                        "Desactivar"
+                                    } else {
+                                        "Activar"
+                                    })
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        this.confirm_change(id, window, cx)
+                                    })),
+                            )
+                        })
+                        .when(allowed(state, "biometrics.enroll"), |this| {
+                            let has_fp = person.fingerprint_registered;
+                            let is_active = person.active;
+                            this.child(
+                                Button::new(format!("person-bio-{id}"))
+                                    .ghost()
+                                    .small()
+                                    .disabled(!is_active)
+                                    .icon(LucideIcon::FingerprintPattern)
+                                    .tooltip(if !is_active {
+                                        "Activa al pensionista para gestionar su huella"
+                                    } else if has_fp {
+                                        "Gestionar huella"
+                                    } else {
+                                        "Registrar huella"
+                                    })
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        this.open_biometric_enroll_modal(id, window, cx)
                                     })),
                             )
                         }),
@@ -1225,7 +1419,7 @@ pub fn render(
                 .overflow_x_scrollbar()
                 .child(
                     v_flex()
-                        .min_w(px(830.))
+                        .min_w(px(890.))
                         .child(
                             h_flex()
                                 .gap_3()
@@ -1241,7 +1435,7 @@ pub fn render(
                                 .child(text_cell("Estado", 90.))
                                 .child(text_cell("Huella", 105.))
                                 .child(text_cell("Saldo", 95.))
-                                .child(text_cell("Acciones", 120.)),
+                                .child(text_cell("Acciones", 180.)),
                         )
                         .child(rows),
                 )
