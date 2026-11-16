@@ -1,9 +1,18 @@
 use gpui_kit::{
     App, Context, FontWeight, IntoElement, ParentElement, Styled, div, px,
     assets::IconName,
-    component::{ActiveTheme as _, Icon, Sizable as _, button::{Button, ButtonVariants as _}, h_flex, scroll::ScrollableElement as _, spinner::Spinner, v_flex},
+    component::{
+        ActiveTheme as _, Sizable as _,
+        button::{Button, ButtonVariants as _},
+        h_flex, scroll::ScrollableElement as _, spinner::Spinner, v_flex,
+    },
 };
-use crate::{layout::DesktopApp, mock_data::DashboardSummary, state::{AppState, DataStatus}};
+use crate::{
+    components::common::{SemanticTone as CardTone, metric_card},
+    layout::DesktopApp,
+    mock_data::DashboardSummary,
+    state::{AppState, DataStatus},
+};
 
 fn money(cents: i64) -> String { format!("S/ {}.{:02}", cents / 100, cents.abs() % 100) }
 
@@ -12,16 +21,10 @@ fn card(
     value: String,
     detail: impl Into<gpui_kit::SharedString>,
     icon: IconName,
+    tone: CardTone,
     cx: &App,
 ) -> impl IntoElement {
-    let theme = cx.theme();
-    v_flex().flex_1().min_w(px(200.)).gap_3().p_4().rounded(theme.radius_lg)
-        .bg(theme.colors.list).border_1().border_color(theme.border)
-        .child(h_flex().justify_between().gap_2()
-            .child(div().text_sm().text_color(theme.muted_foreground).child(title))
-            .child(Icon::new(icon).size_4().text_color(theme.primary)))
-        .child(div().text_2xl().font_weight(FontWeight::BOLD).child(value))
-        .child(div().text_xs().text_color(theme.muted_foreground).child(detail.into()))
+    metric_card(title, value, Some(detail.into()), icon, tone, cx)
 }
 
 fn cell(text: impl Into<gpui_kit::SharedString>, width: f32) -> impl IntoElement {
@@ -81,16 +84,17 @@ pub fn render(state: &AppState, cx: &Context<DesktopApp>, app_cx: &App) -> impl 
                 .child(div().text_sm().text_color(theme.muted_foreground)
                     .child("Datos de demostración · Las operaciones corresponden a la fecha seleccionada."))
                 .child(h_flex().gap_4().flex_wrap()
-                    .child(card("Pensionistas registrados", summary.registered.to_string(), "Total actual", IconName::Users, app_cx))
-                    .child(card("Pensionistas activos", summary.active.to_string(), "Estado actual", IconName::Users, app_cx))
-                    .child(card("Desayunos", summary.breakfasts.to_string(), format!("Atenciones · {} ración(es)", summary.breakfast_portions), IconName::Utensils, app_cx))
-                    .child(card("Almuerzos", summary.lunches.to_string(), format!("Atenciones · {} ración(es)", summary.lunch_portions), IconName::Utensils, app_cx)))
+                    .child(card("Pensionistas registrados", summary.registered.to_string(), "Total actual", IconName::Users, CardTone::Neutral, app_cx))
+                    .child(card("Pensionistas activos", summary.active.to_string(), "Estado actual", IconName::Users, CardTone::Neutral, app_cx))
+                    .child(card("Desayunos", summary.breakfasts.to_string(), format!("Atenciones · {} ración(es)", summary.breakfast_portions), IconName::Utensils, CardTone::Amber, app_cx))
+                    .child(card("Almuerzos", summary.lunches.to_string(), format!("Atenciones · {} ración(es)", summary.lunch_portions), IconName::Utensils, CardTone::Orange, app_cx)))
                 .child(h_flex().gap_4().flex_wrap()
-                    .child(card("Raciones entregadas", summary.portions.to_string(), format!("En {} atención(es) del día", summary.attentions()), IconName::Utensils, app_cx))
-                    .child(card("Importe consumido", money(summary.consumed_cents), "Consumos de la fecha", IconName::Wallet, app_cx))
-                    .child(card("Efectivo ingresado", money(summary.cash_paid_cents), "Solo pagos en efectivo", IconName::Wallet, app_cx))
-                    .child(card("Tickets recibidos", format!("{} und.", summary.tickets_count), format!("Equivalente: {}", money(summary.tickets_cents)), IconName::Ticket, app_cx))
-                    .child(card("Deuda pendiente", money(summary.debt_cents), format!("Acumulada · A favor: {}", money(summary.credit_balance_cents)), IconName::Wallet, app_cx)))
+                    .child(card("Raciones entregadas", summary.portions.to_string(), format!("En {} atención(es) del día", summary.attentions()), IconName::Utensils, CardTone::Neutral, app_cx))
+                    .child(card("Importe consumido", money(summary.consumed_cents), "Consumos de la fecha", IconName::Wallet, CardTone::Neutral, app_cx))
+                    .child(card("Efectivo ingresado", money(summary.cash_paid_cents), "Solo pagos en efectivo", IconName::Wallet, CardTone::Green, app_cx))
+                    .child(card("Tickets recibidos", format!("{} und.", summary.tickets_count), format!("Equivalente: {}", money(summary.tickets_cents)), IconName::Ticket, CardTone::Blue, app_cx))
+                    .child(card("Saldo a favor", money(summary.credit_balance_cents), "Excedentes de pensionistas", IconName::Wallet, CardTone::SoftGreen, app_cx))
+                    .child(card("Deuda pendiente", money(summary.debt_cents), "Acumulada hasta la fecha", IconName::Wallet, CardTone::SoftRed, app_cx)))
                 .child(table(&summary, app_cx)).into_any_element()
         },
     };

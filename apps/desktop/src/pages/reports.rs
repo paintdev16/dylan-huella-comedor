@@ -21,6 +21,7 @@ use gpui_kit::{
 };
 
 use crate::{
+    components::common::{SemanticTone, metric_card},
     layout::DesktopApp,
     reports_service::{
         ConsumptionSortColumn, ConsumptionTypeFilter, DateRangePreset, DebtSortColumn,
@@ -37,6 +38,7 @@ pub enum ReportTab {
     #[default]
     Consumptions,
     Payments,
+    Tickets,
     Debts,
     Summaries,
 }
@@ -69,23 +71,15 @@ fn empty_state(icon: LucideIcon, title: &'static str, description: &'static str)
     )
 }
 
-fn kpi_card(title: &'static str, value: String, subtitle: String, app: &App) -> impl IntoElement {
-    let theme = app.theme();
-    div()
-        .flex_1()
-        .min_w(px(175.))
-        .p_3p5()
-        .rounded(theme.radius_lg)
-        .border_1()
-        .border_color(theme.border)
-        .bg(theme.colors.list)
-        .child(
-            v_flex()
-                .gap_1()
-                .child(div().text_xs().text_color(theme.muted_foreground).child(title))
-                .child(div().text_xl().font_weight(FontWeight::BOLD).child(value))
-                .child(div().text_xs().text_color(theme.muted_foreground).child(subtitle)),
-        )
+fn kpi_card(
+    title: &'static str,
+    value: String,
+    subtitle: String,
+    icon: LucideIcon,
+    tone: SemanticTone,
+    app: &App,
+) -> impl IntoElement {
+    metric_card(title, value, Some(subtitle.into()), icon, tone, app)
 }
 
 fn sort_header(
@@ -293,7 +287,7 @@ pub fn render(
                 }
             });
         }
-        ReportTab::Summaries => {}
+        ReportTab::Tickets | ReportTab::Summaries => {}
     }
 
     let totals = &snapshot.totals;
@@ -302,7 +296,7 @@ pub fn render(
         data.pensioners
             .iter()
             .find(|p| p.id == pid)
-            .map(|p| format!("#{} · {}", p.id, p.name()))
+            .map(|p| p.name())
     });
 
     v_flex()
@@ -346,6 +340,8 @@ pub fn render(
                         totals.economic_lunch_portions,
                         totals.special_portions
                     ),
+                    LucideIcon::Utensils,
+                    SemanticTone::Orange,
                     app,
                 ))
                 .child(kpi_card(
@@ -355,6 +351,8 @@ pub fn render(
                         "Atenciones: {} · Terceros: {}",
                         totals.total_attentions, totals.third_party_deliveries
                     ),
+                    LucideIcon::Wallet,
+                    SemanticTone::Violet,
                     app,
                 ))
                 .child(kpi_card(
@@ -366,16 +364,32 @@ pub fn render(
                         amount(totals.total_ticket_cents),
                         snapshot.payments.len()
                     ),
+                    LucideIcon::Wallet,
+                    SemanticTone::Green,
+                    app,
+                ))
+                .child(kpi_card(
+                    "Tickets recibidos",
+                    format!("{} und.", totals.total_ticket_count),
+                    format!("Equivalente: {}", amount(totals.total_ticket_cents)),
+                    LucideIcon::Ticket,
+                    SemanticTone::Blue,
+                    app,
+                ))
+                .child(kpi_card(
+                    "Saldo a favor",
+                    amount(totals.total_credit_cents),
+                    "Excedentes acumulados".to_string(),
+                    LucideIcon::Wallet,
+                    SemanticTone::SoftGreen,
                     app,
                 ))
                 .child(kpi_card(
                     "Deuda pendiente",
                     amount(totals.total_debt_cents),
-                    format!(
-                        "{} pensionista(s) · A favor: {}",
-                        snapshot.debts.len(),
-                        amount(totals.total_credit_cents)
-                    ),
+                    format!("{} pensionista(s)", snapshot.debts.len()),
+                    LucideIcon::Wallet,
+                    SemanticTone::SoftRed,
                     app,
                 )),
         )
@@ -507,6 +521,7 @@ pub fn render(
                 [
                     (ReportTab::Consumptions, "Historial de consumos"),
                     (ReportTab::Payments, "Pagos y abonos"),
+                    (ReportTab::Tickets, "Historial de tickets"),
                     (ReportTab::Debts, "Deudas pendientes"),
                     (ReportTab::Summaries, "Resumen diario y mensual"),
                 ]
@@ -629,7 +644,7 @@ pub fn render(
                                                         Button::new(format!("rep-pick-{idx}-{pid}"))
                                                             .ghost()
                                                             .xsmall()
-                                                            .label(format!("#{pid} {}", r.pensioner_name))
+                                                            .label(r.pensioner_name.clone())
                                                             .on_click(cx.listener(move |this, _, _, cx| {
                                                                 this.report_pensioner_id = Some(pid);
                                                                 this.report_page = 0;
@@ -751,7 +766,7 @@ pub fn render(
                                                     130.,
                                                 ))
                                                 .child(text_cell(
-                                                    format!("#{} {}", r.pensioner_id, r.pensioner_name),
+                                                    r.pensioner_name.clone(),
                                                     190.,
                                                 ))
                                                 .child(text_cell(r.kind_label.clone(), 150.))
@@ -764,6 +779,100 @@ pub fn render(
                             page,
                             total_pages,
                             snapshot.payments.len(),
+                            cx,
+                            app,
+                        ))
+                        .into_any_element()
+                }
+            }
+            ReportTab::Tickets => {
+                let (rows_slice, page, total_pages) =
+                    paginate(&snapshot.tickets, app_view.report_page, PAGE_SIZE);
+                if snapshot.tickets.is_empty() {
+                    empty_state(
+                        LucideIcon::Ticket,
+                        "Sin tickets registrados",
+                        "No hay entregas de tickets físicos que coincidan con los filtros.",
+                    )
+                    .into_any_element()
+                } else {
+                    v_flex()
+                        .gap_2()
+                        .child(
+                            div()
+                                .rounded(theme.radius_lg)
+                                .border_1()
+                                .border_color(theme.border)
+                                .bg(theme.colors.list)
+                                .overflow_x_scrollbar()
+                                .child(
+                                    v_flex()
+                                        .min_w(px(940.))
+                                        .child(
+                                            h_flex()
+                                                .gap_2()
+                                                .px_3()
+                                                .py_2p5()
+                                                .bg(theme.colors.table_head)
+                                                .child(text_cell("Fecha / Hora", 115.))
+                                                .child(text_cell("Movimiento", 95.))
+                                                .child(text_cell("Pensionista", 170.))
+                                                .child(text_cell("Cantidad", 75.))
+                                                .child(text_cell("Valor unit.", 85.))
+                                                .child(text_cell("Importe", 90.))
+                                                .child(text_cell("Consumo asoc.", 100.))
+                                                .child(text_cell("Saldo result.", 120.))
+                                                .child(text_cell("Operador", 120.)),
+                                        )
+                                        .children(rows_slice.iter().map(|t| {
+                                            h_flex()
+                                                .gap_2()
+                                                .px_3()
+                                                .py_2p5()
+                                                .border_t_1()
+                                                .border_color(theme.border)
+                                                .child(text_cell(
+                                                    format!("{} {}", t.date.format("%d/%m/%Y"), t.time),
+                                                    115.,
+                                                ))
+                                                .child(div().w(px(95.)).flex_shrink_0().child(
+                                                    Tag::secondary().small().child(t.movement_id.clone()),
+                                                ))
+                                                .child(text_cell(t.pensioner_name.clone(), 170.))
+                                                .child(text_cell(format!("{} und.", t.ticket_count), 75.))
+                                                .child(text_cell(amount(t.unit_cents), 85.))
+                                                .child(text_cell(amount(t.total_cents), 90.))
+                                                .child(text_cell(
+                                                    t.consumption_cents
+                                                        .map(amount)
+                                                        .unwrap_or_else(|| "Solo abono".into()),
+                                                    100.,
+                                                ))
+                                                .child(div().w(px(120.)).flex_shrink_0().child(
+                                                    match t.resulting_balance_cents {
+                                                        Some(b) if b < 0 => Tag::info()
+                                                            .outline()
+                                                            .small()
+                                                            .child(format!("A favor {}", amount(-b))),
+                                                        Some(b) if b > 0 => Tag::warning()
+                                                            .small()
+                                                            .child(format!("Deuda {}", amount(b))),
+                                                        Some(_) => Tag::success()
+                                                            .outline()
+                                                            .small()
+                                                            .child("Al día"),
+                                                        None => Tag::secondary().small().child("—"),
+                                                    },
+                                                ))
+                                                .child(text_cell(t.operator_name.clone(), 120.))
+                                        })),
+                                ),
+                        )
+                        .child(pagination_bar(
+                            "tickets",
+                            page,
+                            total_pages,
+                            snapshot.tickets.len(),
                             cx,
                             app,
                         ))
@@ -851,7 +960,7 @@ pub fn render(
                                             .border_t_1()
                                             .border_color(theme.border)
                                             .child(text_cell(
-                                                format!("#{pid} {}", r.pensioner_name),
+                                                r.pensioner_name.clone(),
                                                 200.,
                                             ))
                                             .child(div().w(px(85.)).flex_shrink_0().child(

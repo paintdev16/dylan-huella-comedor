@@ -155,7 +155,6 @@ pub struct Consumption {
 pub enum PaymentKind {
     CashPayment,
     TicketCredit { count: u32, unit_cents: i64 },
-    AuthorizedDiscount { reason: String },
 }
 
 impl PaymentKind {
@@ -163,7 +162,6 @@ impl PaymentKind {
         match self {
             Self::CashPayment => "Pago",
             Self::TicketCredit { .. } => "Abono por tickets",
-            Self::AuthorizedDiscount { .. } => "Descuento autorizado",
         }
     }
 }
@@ -184,7 +182,6 @@ pub enum CashMovementKind {
     Closing,
     Payment,
     TicketCredit,
-    Discount,
 }
 
 impl CashMovementKind {
@@ -194,7 +191,6 @@ impl CashMovementKind {
             Self::Closing => "Cierre de caja",
             Self::Payment => "Pago en efectivo",
             Self::TicketCredit => "Abono por tickets",
-            Self::Discount => "Descuento autorizado",
         }
     }
 }
@@ -244,7 +240,6 @@ pub struct MonthlyPensionerSummary {
     pub consumed_cents: i64,
     pub cash_paid_cents: i64,
     pub tickets_cents: i64,
-    pub discounts_cents: i64,
     pub net_balance_cents: i64,
 }
 
@@ -429,7 +424,6 @@ impl MockData {
                     consumed_cents: 0,
                     cash_paid_cents: 0,
                     tickets_cents: 0,
-                    discounts_cents: 0,
                     net_balance_cents: 0,
                 });
             entry.consumed_cents += c.cents;
@@ -444,13 +438,11 @@ impl MockData {
                     consumed_cents: 0,
                     cash_paid_cents: 0,
                     tickets_cents: 0,
-                    discounts_cents: 0,
                     net_balance_cents: 0,
                 });
             match &p.kind {
                 PaymentKind::CashPayment => entry.cash_paid_cents += p.cents,
                 PaymentKind::TicketCredit { .. } => entry.tickets_cents += p.cents,
-                PaymentKind::AuthorizedDiscount { .. } => entry.discounts_cents += p.cents,
             }
         }
 
@@ -459,7 +451,7 @@ impl MockData {
             .rev()
             .map(|mut m| {
                 m.net_balance_cents =
-                    m.consumed_cents - (m.cash_paid_cents + m.tickets_cents + m.discounts_cents);
+                    m.consumed_cents - (m.cash_paid_cents + m.tickets_cents);
                 m
             })
             .collect()
@@ -606,13 +598,19 @@ impl MockData {
             movement_id: mov_id.clone(),
             kind: PaymentKind::CashPayment,
         });
+        let person_name = self
+            .pensioners
+            .iter()
+            .find(|p| p.id == pensioner_id)
+            .map(|p| p.name())
+            .unwrap_or_else(|| "Pensionista".to_string());
         self.cash_register.movements.push(CashMovement {
             id: mov_id.clone(),
             date,
             time: time.to_string(),
             kind: CashMovementKind::Payment,
             pensioner_id: Some(pensioner_id),
-            description: format!("{label} · Pensionista #{pensioner_id}"),
+            description: format!("{label} · {person_name}"),
             cents: amount_cents,
             operator_name: "Sistema".into(),
             ticket_count: None,
@@ -689,6 +687,12 @@ impl MockData {
                 unit_cents,
             },
         });
+        let person_name = self
+            .pensioners
+            .iter()
+            .find(|p| p.id == pensioner_id)
+            .map(|p| p.name())
+            .unwrap_or_else(|| "Pensionista".to_string());
         let resulting_balance = self.net_balance(pensioner_id);
         self.cash_register.movements.push(CashMovement {
             id: mov_id.to_string(),
@@ -697,7 +701,7 @@ impl MockData {
             kind: CashMovementKind::TicketCredit,
             pensioner_id: Some(pensioner_id),
             description: format!(
-                "{ticket_count} ticket(s) × S/ {}.{:02} · Pensionista #{pensioner_id}",
+                "{ticket_count} ticket(s) × S/ {}.{:02} · {person_name}",
                 unit_cents / 100,
                 unit_cents % 100
             ),
@@ -708,53 +712,6 @@ impl MockData {
             consumption_cents,
             resulting_balance_cents: Some(resulting_balance),
         });
-    }
-
-    pub fn record_discount(
-        &mut self,
-        date: NaiveDate,
-        time: &str,
-        pensioner_id: u32,
-        amount_cents: i64,
-        reason: &str,
-        request_token: u64,
-        processed_tokens: &mut HashSet<u64>,
-    ) -> Result<String, String> {
-        if processed_tokens.contains(&request_token) {
-            return Err("Este descuento ya fue contabilizado (se evitó duplicado).".into());
-        }
-        let clean_reason = reason.trim();
-        if clean_reason.chars().count() < 3 {
-            return Err("Indica el motivo o autorización del descuento.".into());
-        }
-        self.ensure_cash_credit_target(pensioner_id, amount_cents)?;
-        processed_tokens.insert(request_token);
-        let mov_id = self.next_movement_id();
-        self.payments.push(Payment {
-            date,
-            time: time.to_string(),
-            pensioner_id,
-            cents: amount_cents,
-            movement_id: mov_id.clone(),
-            kind: PaymentKind::AuthorizedDiscount {
-                reason: clean_reason.to_string(),
-            },
-        });
-        self.cash_register.movements.push(CashMovement {
-            id: mov_id.clone(),
-            date,
-            time: time.to_string(),
-            kind: CashMovementKind::Discount,
-            pensioner_id: Some(pensioner_id),
-            description: format!("Descuento ({clean_reason}) · Pensionista #{pensioner_id}"),
-            cents: amount_cents,
-            operator_name: "Sistema".into(),
-            ticket_count: None,
-            ticket_unit_cents: None,
-            consumption_cents: None,
-            resulting_balance_cents: Some(self.net_balance(pensioner_id)),
-        });
-        Ok(mov_id)
     }
 
     pub fn set_movement_operator(&mut self, movement_id: &str, operator: &str) {
@@ -1145,7 +1102,7 @@ impl MockData {
                         time: "13:05".into(),
                         kind: CashMovementKind::Payment,
                         pensioner_id: Some(1),
-                        description: "Pago parcial · Pensionista #1".into(),
+                        description: "Pago parcial · Juan Pérez".into(),
                         cents: 1000,
                         operator_name: "Cajero de prueba".into(),
                         ticket_count: None,
@@ -1159,7 +1116,7 @@ impl MockData {
                         time: "15:00".into(),
                         kind: CashMovementKind::Payment,
                         pensioner_id: Some(2),
-                        description: "Pago parcial · Pensionista #2".into(),
+                        description: "Pago parcial · María Gómez".into(),
                         cents: 500,
                         operator_name: "Administradora de prueba".into(),
                         ticket_count: None,
@@ -1226,7 +1183,6 @@ impl MockData {
                         result.tickets_cents += p.cents;
                         "Tickets"
                     }
-                    PaymentKind::AuthorizedDiscount { .. } => "Descuento",
                 };
                 let portions = match &p.kind {
                     PaymentKind::TicketCredit { count, .. } => Some(*count),
@@ -1426,7 +1382,7 @@ mod tests {
         assert_eq!(data.balance(1), 3200);
     }
     #[test]
-    fn cash_register_payments_tickets_discounts_and_idempotency() {
+    fn cash_register_payments_tickets_and_idempotency() {
         let date = NaiveDate::from_ymd_opt(2026, 1, 2).unwrap();
         let mut data = MockData::demo(date);
         let mut tokens = HashSet::new();
@@ -1449,18 +1405,11 @@ mod tests {
         // Evita contabilizar dos veces el mismo movimiento
         assert!(data.record_ticket_credit(date, "14:05", 3, 2, 2, &mut tokens).is_err());
 
-        // Descuento autorizado de S/ 1.50 (150), deuda queda en 250
-        let mov_d = data
-            .record_discount(date, "14:10", 3, 150, "Cortesía gerencia", 3, &mut tokens)
-            .unwrap();
-        assert_eq!(mov_d, "MOV-0005");
-        assert_eq!(data.balance(3), 250);
-
-        // Pago completo del saldo restante (250)
+        // Pago completo del saldo restante (400)
         let mov_p = data
-            .record_payment(date, "14:15", 3, 250, 4, &mut tokens)
+            .record_payment(date, "14:15", 3, 400, 4, &mut tokens)
             .unwrap();
-        assert_eq!(mov_p, "MOV-0006");
+        assert_eq!(mov_p, "MOV-0005");
         assert_eq!(data.balance(3), 0);
 
         // Resumen mensual coherente
@@ -1468,13 +1417,12 @@ mod tests {
         assert_eq!(monthly.len(), 1);
         assert_eq!(monthly[0].consumed_cents, 1800);
         assert_eq!(monthly[0].tickets_cents, 1400);
-        assert_eq!(monthly[0].discounts_cents, 150);
-        assert_eq!(monthly[0].cash_paid_cents, 250);
+        assert_eq!(monthly[0].cash_paid_cents, 400);
         assert_eq!(monthly[0].net_balance_cents, 0);
 
         // Cierre de caja bloquea nuevos pagos hasta reabrir
         let (_close_id, expected) = data.close_cash_register(date, "20:00", 5, &mut tokens).unwrap();
-        assert_eq!(expected, 10000 + 1000 + 500 + 250);
+        assert_eq!(expected, 10000 + 1000 + 500 + 400);
         assert!(data.record_payment(date, "20:05", 1, 100, 6, &mut tokens).is_err());
         data.open_cash_register(date, "21:00", 5000, 7, &mut tokens)
             .unwrap();
@@ -1644,3 +1592,4 @@ mod tests {
         assert_eq!(dash.cash_paid_cents, 1000);
     }
 }
+

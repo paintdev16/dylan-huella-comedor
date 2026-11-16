@@ -4,16 +4,17 @@ use crate::{
     biometric_service::{
         BiometricEvent, EnrollmentStep, generate_unique_biometric_id,
     },
+    components::common::{SemanticTone, metric_card},
     layout::DesktopApp,
-    mock_data::{MockData, Pensioner},
+    mock_data::{MockData, PaymentKind, Pensioner},
     state::{AppState, DataStatus, Page},
 };
 use gpui_kit::{
-    App, AppContext as _, Context, Entity, FontWeight, IntoElement, ParentElement, SharedString,
-    Styled, WeakEntity, Window,
+    App, AppContext as _, Context, Entity, FontWeight, IntoElement, ParentElement, Styled,
+    WeakEntity, Window,
     assets::IconName as LucideIcon,
     component::{
-        ActiveTheme as _, Disableable as _, Icon, Sizable as _, WindowExt as _,
+        ActiveTheme as _, Disableable as _, Icon, Sizable as _, Size, WindowExt as _,
         alert::Alert,
         button::{Button, ButtonVariants as _},
         checkbox::Checkbox,
@@ -22,9 +23,9 @@ use gpui_kit::{
         h_flex,
         input::{Input, InputState},
         notification::Notification,
-        scroll::ScrollableElement as _,
         spinner::Spinner,
         switch::Switch,
+        table::{Column, ColumnSort, DataTable, TableDelegate, TableState},
         tag::Tag,
         v_flex,
     },
@@ -50,13 +51,45 @@ fn amount(cents: i64) -> String {
     format!("{sign}S/ {}.{:02}", abs / 100, abs % 100)
 }
 
-fn text_cell(value: impl Into<SharedString>, width: f32) -> impl IntoElement {
-    div()
-        .w(px(width))
-        .flex_shrink_0()
-        .text_sm()
-        .truncate()
-        .child(value.into())
+fn balance_cell(
+    id: u32,
+    is_credit: bool,
+    cents: i64,
+    revealed: bool,
+    app_weak: &WeakEntity<DesktopApp>,
+    theme_cx: &App,
+) -> impl IntoElement {
+    let category = if is_credit { "saldo a favor" } else { "saldo en contra" };
+    let action = if revealed { "Ocultar" } else { "Mostrar" };
+    let label = if revealed { amount(cents) } else { "••••••".to_string() };
+    let color = if cents == 0 {
+        theme_cx.theme().muted_foreground
+    } else if is_credit {
+        theme_cx.theme().success
+    } else {
+        theme_cx.theme().danger
+    };
+    let app_btn = app_weak.clone();
+    div().w(px(110.)).flex_shrink_0().child(
+        Button::new(format!("pensioner-balance-{id}-{is_credit}"))
+            .ghost().small().icon(LucideIcon::Eye)
+            .text_color(color)
+            .label(label)
+            .accessibility_label(format!("{action} {category}"))
+            .tooltip(format!("{action} {category}"))
+            .on_click(move |_, _, cx| {
+                let _ = app_btn.update(cx, |this, cx| {
+                    if !this.state.auth.can_view(Page::Pensionistas) || this.state.page != Page::Pensionistas {
+                        return;
+                    }
+                    let key = (id, is_credit);
+                    if !this.revealed_pensioner_balances.remove(&key) {
+                        this.revealed_pensioner_balances.insert(key);
+                    }
+                    cx.notify();
+                });
+            }),
+    )
 }
 
 fn status_tag(active: bool) -> Tag {
@@ -216,15 +249,10 @@ impl DesktopApp {
             self.biometric_gateway.set_modal_locked(true);
         }
 
-        let initial_enroll = is_new && can_enroll && reader_available;
         let enroll_state = cx.new(|_| NewEnrollFormState {
-            enabled: initial_enroll,
+            enabled: false,
             consent_given: false,
-            step: if initial_enroll {
-                EnrollmentStep::WaitingFinger
-            } else {
-                EnrollmentStep::Idle
-            },
+            step: EnrollmentStep::Idle,
             op_seq: 0,
         });
 
@@ -268,8 +296,6 @@ impl DesktopApp {
             let enroll_submit = enroll_state.clone();
 
             let app_cap = app.clone();
-            let app_switch = app.clone();
-            let app_consent = app.clone();
             let app_save = app_on_save.clone();
             let app_cancel_dlg = app_on_cancel_dlg.clone();
             let app_cancel_btn = app_on_cancel_btn.clone();
@@ -283,8 +309,8 @@ impl DesktopApp {
 
             dialog
                 .width(px(520.))
-                .title(if let Some(pid) = id {
-                    format!("Editar pensionista #{pid}")
+                .title(if id.is_some() {
+                    "Editar pensionista".to_string()
                 } else {
                     "Nuevo pensionista".to_string()
                 })
@@ -301,24 +327,6 @@ impl DesktopApp {
                         .gap_3p5()
                         .when_some(current_error, |this, err| {
                             this.child(Alert::error("pensioner-form-error", err))
-                        })
-                        .when_some(id, |this, pid| {
-                            this.child(
-                                h_flex()
-                                    .justify_between()
-                                    .p_2p5()
-                                    .rounded(cx.theme().radius)
-                                    .border_1()
-                                    .border_color(cx.theme().border)
-                                    .bg(cx.theme().muted)
-                                    .child(
-                                        div()
-                                            .text_xs()
-                                            .text_color(cx.theme().muted_foreground)
-                                            .child("Identificador único (inmutable)"),
-                                    )
-                                    .child(Tag::secondary().small().child(format!("#{pid}"))),
-                            )
                         })
                         .child(
                             v_flex()
@@ -374,7 +382,7 @@ impl DesktopApp {
                                                             } else if !reader_available {
                                                                 "Lector no conectado; se guardará como Pendiente (alternativa manual)."
                                                             } else {
-                                                                "Identificación de consumos suspendida durante la captura."
+                                                                "Opcional: activa esta opción para iniciar el registro simulado."
                                                             }),
                                                     ),
                                             )
@@ -383,25 +391,17 @@ impl DesktopApp {
                                                     .checked(enr.enabled)
                                                     .disabled(!can_enroll || !reader_available || is_busy)
                                                     .on_change(move |checked: &bool, _, cx| {
-                                                        let should_start = enroll_switch.update(cx, |s, cx| {
+                                                        enroll_switch.update(cx, |s, cx| {
                                                             s.enabled = *checked;
                                                             s.op_seq = s.op_seq.wrapping_add(1);
+                                                            if !*checked { s.consent_given = false; }
                                                             s.step = if *checked {
                                                                 EnrollmentStep::WaitingFinger
                                                             } else {
                                                                 EnrollmentStep::Idle
                                                             };
                                                             cx.notify();
-                                                            *checked && s.consent_given
                                                         });
-                                                        if should_start {
-                                                            start_simulated_enrollment_capture(
-                                                                enroll_switch.clone(),
-                                                                app_switch.clone(),
-                                                                240,
-                                                                cx,
-                                                            );
-                                                        }
                                                     }),
                                             ),
                                     )
@@ -409,51 +409,42 @@ impl DesktopApp {
                                         this.child(
                                             Checkbox::new("new-pensioner-consent")
                                                 .checked(enr.consent_given)
-                                                .label("Consentimiento informado otorgado (alternativa: identificación manual)")
+                                                .label("Consentimiento informado otorgado")
                                                 .on_click(move |checked: &bool, _, cx| {
-                                                    let should_start = enroll_consent.update(cx, |s, cx| {
+                                                    enroll_consent.update(cx, |s, cx| {
                                                         s.consent_given = *checked;
-                                                        if !*checked && !matches!(s.step, EnrollmentStep::Registered { .. }) {
+                                                        if !*checked {
                                                             s.op_seq = s.op_seq.wrapping_add(1);
                                                             s.step = EnrollmentStep::WaitingFinger;
                                                         }
                                                         cx.notify();
-                                                        *checked
-                                                            && s.enabled
-                                                            && !matches!(
-                                                                s.step,
-                                                                EnrollmentStep::Capturing
-                                                                    | EnrollmentStep::Verifying
-                                                                    | EnrollmentStep::Registered { .. }
-                                                            )
                                                     });
-                                                    if should_start {
-                                                        start_simulated_enrollment_capture(
-                                                            enroll_consent.clone(),
-                                                            app_consent.clone(),
-                                                            240,
-                                                            cx,
-                                                        );
-                                                    }
                                                 }),
                                         )
                                         .child(
-                                            h_flex()
-                                                .justify_between()
+                                            v_flex()
                                                 .gap_2()
                                                 .child(
                                                     h_flex()
                                                         .gap_2()
+                                                        .flex_wrap()
                                                         .when(is_busy, |this| {
                                                             this.child(Spinner::new().small())
                                                         })
-                                                        .child(enrollment_tag(&enr.step))
+                                                        .child(if !enr.consent_given {
+                                                            Tag::secondary().small().child("Pendiente de consentimiento")
+                                                        } else if matches!(enr.step, EnrollmentStep::WaitingFinger) {
+                                                            Tag::info().outline().small().child("Listo para simular")
+                                                        } else {
+                                                            enrollment_tag(&enr.step)
+                                                        })
                                                         .when_some(
                                                             match &enr.step {
                                                                 EnrollmentStep::Registered { biometric_id } => {
                                                                     Some(format!("Código asignado: {biometric_id}"))
                                                                 }
                                                                 EnrollmentStep::Error(msg) => Some(msg.clone()),
+                                                                EnrollmentStep::WaitingFinger if enr.consent_given => Some("Pulsa «Simular captura» para continuar.".to_string()),
                                                                 _ => None,
                                                             },
                                                             |this, text| {
@@ -469,6 +460,7 @@ impl DesktopApp {
                                                 .child(
                                                     h_flex()
                                                         .gap_1p5()
+                                                        .flex_wrap()
                                                         .child(
                                                             Button::new("new-enroll-sim-capture")
                                                                 .outline()
@@ -476,7 +468,7 @@ impl DesktopApp {
                                                                 .disabled(!enr.consent_given || is_busy || matches!(enr.step, EnrollmentStep::Registered { .. }))
                                                                 .icon(LucideIcon::FingerprintPattern)
                                                                 .label(match &enr.step {
-                                                                    EnrollmentStep::Registered { .. } => "Captura simulada completada",
+                                                                    EnrollmentStep::Registered { .. } => "Captura completada",
                                                                     EnrollmentStep::Error(_) => "Reintentar",
                                                                     _ => "Simular captura",
                                                                 })
@@ -493,7 +485,7 @@ impl DesktopApp {
                                                             Button::new("new-enroll-sim-err")
                                                                 .ghost()
                                                                 .xsmall()
-                                                                .disabled(!enr.consent_given || is_busy)
+                                                                .disabled(!enr.consent_given || is_busy || matches!(enr.step, EnrollmentStep::Registered { .. }))
                                                                 .label("Simular error")
                                                                 .on_click(move |_, _, cx| {
                                                                     enroll_fail.update(cx, |s, cx| {
@@ -770,7 +762,7 @@ impl DesktopApp {
                                             div()
                                                 .text_sm()
                                                 .font_weight(FontWeight::SEMIBOLD)
-                                                .child(format!("Pensionista #{id} · {name}")),
+                                                .child(format!("Pensionista · {name}")),
                                         )
                                         .child(
                                             div()
@@ -961,7 +953,7 @@ impl DesktopApp {
         let name = person.name();
         let app = cx.entity().downgrade();
         let description = format!(
-            "¿Deseas {} a {name} (ID #{id})?",
+            "¿Deseas {} a {name}?",
             if was_active { "desactivar" } else { "activar" }
         );
         window.open_dialog(cx, move |dialog, _, _| {
@@ -1021,33 +1013,15 @@ impl DesktopApp {
     }
 }
 
-fn summary_box(title: &'static str, value: String, app: &App) -> impl IntoElement {
-    let theme = app.theme();
-    div()
-        .flex_1()
-        .min_w(px(170.))
-        .p_3p5()
-        .rounded(theme.radius_lg)
-        .border_1()
-        .border_color(theme.border)
-        .bg(theme.colors.list)
-        .child(
-            v_flex()
-                .gap_1()
-                .child(
-                    div()
-                        .text_xs()
-                        .text_color(theme.muted_foreground)
-                        .child(title),
-                )
-                .child(
-                    div()
-                        .text_xl()
-                        .font_weight(FontWeight::BOLD)
-                        .text_color(theme.foreground)
-                        .child(value),
-                ),
-        )
+fn summary_box_toned(
+    title: &'static str,
+    value: String,
+    subtitle: impl Into<gpui_kit::SharedString>,
+    icon: LucideIcon,
+    tone: SemanticTone,
+    app: &App,
+) -> impl IntoElement {
+    metric_card(title, value, Some(subtitle.into()), icon, tone, app)
 }
 
 fn details(
@@ -1077,8 +1051,41 @@ fn details(
         .collect();
 
     let total_consumed: i64 = consumptions.iter().map(|c| c.cents).sum();
-    let total_paid: i64 = payments.iter().map(|p| p.cents).sum();
-    let balance = data.balance(id);
+    let total_cash_paid: i64 = payments
+        .iter()
+        .filter(|p| matches!(p.kind, PaymentKind::CashPayment))
+        .map(|p| p.cents)
+        .sum();
+    let (ticket_count, ticket_total) = data.tickets_for_pensioner(id);
+    let net_balance = data.net_balance(id);
+    let debt = net_balance.max(0);
+    let credit = (-net_balance).max(0);
+    let monthly = data.monthly_summary(id);
+    let ticket_rows: Vec<_> = payments
+        .iter()
+        .filter_map(|p| match p.kind {
+            PaymentKind::TicketCredit { count, unit_cents } => {
+                let mov = data
+                    .cash_register
+                    .movements
+                    .iter()
+                    .find(|m| m.id == p.movement_id);
+                Some((
+                    p.date,
+                    p.time.clone(),
+                    p.movement_id.clone(),
+                    count,
+                    unit_cents,
+                    p.cents,
+                    mov.map(|m| m.operator_name.clone())
+                        .unwrap_or_else(|| "Sistema".into()),
+                    mov.and_then(|m| m.consumption_cents),
+                    mov.and_then(|m| m.resulting_balance_cents),
+                ))
+            }
+            _ => None,
+        })
+        .collect();
 
     v_flex()
         .gap_4()
@@ -1113,8 +1120,14 @@ fn details(
                                         .font_weight(FontWeight::BOLD)
                                         .child(person.name()),
                                 )
-                                .child(Tag::secondary().small().child(format!("ID #{id}")))
                                 .child(status_tag(active))
+                                .child(if credit > 0 {
+                                    Tag::info().small().child(format!("A favor {}", amount(credit)))
+                                } else if debt > 0 {
+                                    Tag::warning().small().child(format!("Debe {}", amount(debt)))
+                                } else {
+                                    Tag::success().outline().small().child("Al día")
+                                })
                                 .child(biometric_tag(person.biometric_status()))
                                 .when_some(person.biometric_id.clone(), |this, bio| {
                                     this.child(Tag::info().outline().small().child(bio))
@@ -1133,14 +1146,190 @@ fn details(
                         ),
                 ),
         )
-        .when(can_consumptions && can_payments, |this| {
+        .when(can_consumptions || can_payments, |this| {
             this.child(
                 h_flex()
                     .gap_3()
                     .flex_wrap()
-                    .child(summary_box("Total consumido", amount(total_consumed), app))
-                    .child(summary_box("Total pagado", amount(total_paid), app))
-                    .child(summary_box("Saldo pendiente", amount(balance), app)),
+                    .child(summary_box_toned(
+                        "Total consumido",
+                        amount(total_consumed),
+                        "Acumulado histórico",
+                        LucideIcon::Utensils,
+                        SemanticTone::Neutral,
+                        app,
+                    ))
+                    .child(summary_box_toned(
+                        "Efectivo pagado",
+                        amount(total_cash_paid),
+                        "Pagos en caja",
+                        LucideIcon::Wallet,
+                        SemanticTone::Green,
+                        app,
+                    ))
+                    .child(summary_box_toned(
+                        "Tickets entregados",
+                        ticket_count.to_string(),
+                        format!("Abono total: {}", amount(ticket_total)),
+                        LucideIcon::Ticket,
+                        SemanticTone::Blue,
+                        app,
+                    ))
+                    .child(summary_box_toned(
+                        "Saldo a favor",
+                        amount(credit),
+                        if credit > 0 {
+                            "Estado activo: a favor"
+                        } else {
+                            "Sin excedente a favor"
+                        },
+                        LucideIcon::Wallet,
+                        if credit > 0 {
+                            SemanticTone::SoftGreen
+                        } else {
+                            SemanticTone::Neutral
+                        },
+                        app,
+                    ))
+                    .child(summary_box_toned(
+                        "Deuda pendiente",
+                        amount(debt),
+                        if debt > 0 {
+                            "Estado activo: debe"
+                        } else {
+                            "Sin deuda pendiente"
+                        },
+                        LucideIcon::Wallet,
+                        if debt > 0 {
+                            SemanticTone::SoftRed
+                        } else {
+                            SemanticTone::Neutral
+                        },
+                        app,
+                    )),
+            )
+        })
+        .when(can_payments, |this| {
+            this.child(
+                GroupBox::new()
+                    .outline()
+                    .title(
+                        h_flex()
+                            .gap_2()
+                            .child(Icon::new(LucideIcon::Ticket).small().text_color(theme.primary))
+                            .child(format!("Historial de tickets entregados ({ticket_count})")),
+                    )
+                    .child(if ticket_rows.is_empty() {
+                        div()
+                            .py_3()
+                            .text_sm()
+                            .text_color(theme.muted_foreground)
+                            .child("Sin tickets físicos entregados.")
+                            .into_any_element()
+                    } else {
+                        v_flex()
+                            .gap_2()
+                            .children(ticket_rows.into_iter().map(
+                                |(
+                                    date,
+                                    time,
+                                    mov_id,
+                                    cnt,
+                                    unit_cents,
+                                    total_cents,
+                                    operator,
+                                    cons_opt,
+                                    res_bal_opt,
+                                )| {
+                                    let extra = match (cons_opt, res_bal_opt) {
+                                        (Some(c), Some(b)) => format!(
+                                            " · Consumo: {} · Saldo: {}",
+                                            amount(c),
+                                            if b < 0 {
+                                                format!("A favor {}", amount(-b))
+                                            } else if b > 0 {
+                                                format!("Deuda {}", amount(b))
+                                            } else {
+                                                "Al día".into()
+                                            }
+                                        ),
+                                        (None, Some(b)) => format!(
+                                            " · Saldo: {}",
+                                            if b < 0 {
+                                                format!("A favor {}", amount(-b))
+                                            } else if b > 0 {
+                                                format!("Deuda {}", amount(b))
+                                            } else {
+                                                "Al día".into()
+                                            }
+                                        ),
+                                        _ => String::new(),
+                                    };
+                                    h_flex()
+                                        .justify_between()
+                                        .gap_3()
+                                        .flex_wrap()
+                                        .py_1p5()
+                                        .border_b_1()
+                                        .border_color(theme.border)
+                                        .child(div().text_sm().child(format!(
+                                            "{} {} · {mov_id} · {cnt} ticket(s) × {} · Por: {operator}{extra}",
+                                            date.format("%d/%m/%Y"),
+                                            time,
+                                            amount(unit_cents)
+                                        )))
+                                        .child(
+                                            div()
+                                                .text_sm()
+                                                .font_weight(FontWeight::SEMIBOLD)
+                                                .child(amount(total_cents)),
+                                        )
+                                },
+                            ))
+                            .into_any_element()
+                    }),
+            )
+        })
+        .when(can_consumptions || can_payments, |this| {
+            this.child(
+                GroupBox::new()
+                    .outline()
+                    .title("Resumen mensual")
+                    .child(if monthly.is_empty() {
+                        div()
+                            .py_3()
+                            .text_sm()
+                            .text_color(theme.muted_foreground)
+                            .child("Sin movimientos mensuales registrados.")
+                            .into_any_element()
+                    } else {
+                        v_flex()
+                            .gap_2()
+                            .children(monthly.into_iter().map(|m| {
+                                h_flex()
+                                    .justify_between()
+                                    .gap_3()
+                                    .flex_wrap()
+                                    .py_1p5()
+                                    .border_b_1()
+                                    .border_color(theme.border)
+                                    .child(div().text_xs().child(format!(
+                                        "{} · Consumos: {} · Efectivo: {} · Tickets: {}",
+                                        m.month_label,
+                                        amount(m.consumed_cents),
+                                        amount(m.cash_paid_cents),
+                                        amount(m.tickets_cents)
+                                    )))
+                                    .child(div().text_xs().font_weight(FontWeight::SEMIBOLD).child(
+                                        if m.net_balance_cents < 0 {
+                                            format!("A favor {}", amount(-m.net_balance_cents))
+                                        } else {
+                                            format!("Neto: {}", amount(m.net_balance_cents))
+                                        },
+                                    ))
+                            }))
+                            .into_any_element()
+                    }),
             )
         })
         .when(can_consumptions, |this| {
@@ -1164,6 +1353,16 @@ fn details(
                         v_flex()
                             .gap_2()
                             .children(consumptions.into_iter().map(|item| {
+                                let detail_part = item
+                                    .detail
+                                    .as_deref()
+                                    .map(|d| format!(" · {d}"))
+                                    .unwrap_or_default();
+                                let pickup_part = item
+                                    .picked_up_by
+                                    .as_deref()
+                                    .map(|p| format!(" · Recoge: {p}"))
+                                    .unwrap_or_default();
                                 h_flex()
                                     .justify_between()
                                     .gap_3()
@@ -1172,10 +1371,11 @@ fn details(
                                     .border_color(theme.border)
                                     .child(
                                         div().text_sm().child(format!(
-                                            "{} {} · {} · {} ración(es)",
+                                            "{} {} · {} ({}) · {} ración(es){detail_part}{pickup_part}",
                                             item.date.format("%d/%m/%Y"),
                                             item.time,
                                             item.meal.label(),
+                                            item.menu_kind.label(),
                                             item.portions
                                         )),
                                     )
@@ -1198,7 +1398,7 @@ fn details(
                         h_flex()
                             .gap_2()
                             .child(Icon::new(LucideIcon::CreditCard).small().text_color(theme.primary))
-                            .child("Historial de pagos"),
+                            .child("Historial de pagos y abonos"),
                     )
                     .child(if payments.is_empty() {
                         div()
@@ -1211,6 +1411,12 @@ fn details(
                         v_flex()
                             .gap_2()
                             .children(payments.into_iter().map(|item| {
+                                let kind_detail = match &item.kind {
+                                    PaymentKind::TicketCredit { count, unit_cents } => {
+                                        format!(" ({count} und. × {})", amount(*unit_cents))
+                                    }
+                                    PaymentKind::CashPayment => String::new(),
+                                };
                                 h_flex()
                                     .justify_between()
                                     .gap_3()
@@ -1218,7 +1424,7 @@ fn details(
                                     .border_b_1()
                                     .border_color(theme.border)
                                     .child(div().text_sm().child(format!(
-                                        "{} {} · {} · {}",
+                                        "{} {} · {} · {}{kind_detail}",
                                         item.date.format("%d/%m/%Y"),
                                         item.time,
                                         item.movement_id,
@@ -1237,6 +1443,333 @@ fn details(
         })
 }
 
+#[derive(Clone, PartialEq, Eq)]
+pub struct PensionerTableRow {
+    pub id: u32,
+    pub name: String,
+    pub phone: String,
+    pub active: bool,
+    pub biometric_status: &'static str,
+    pub has_fp: bool,
+    pub credit_cents: i64,
+    pub debt_cents: i64,
+    pub credit_revealed: bool,
+    pub debt_revealed: bool,
+}
+
+pub struct PensionersTableDelegate {
+    app: WeakEntity<DesktopApp>,
+    columns: Vec<Column>,
+    rows: Vec<PensionerTableRow>,
+    can_update: bool,
+    can_enroll: bool,
+    enrollment_busy: bool,
+    sort: Option<(usize, ColumnSort)>,
+}
+
+impl PensionersTableDelegate {
+    pub fn new(app: WeakEntity<DesktopApp>) -> Self {
+        Self {
+            app,
+            columns: vec![
+                Column::new("name", "Nombre completo").width(210.).sortable(),
+                Column::new("phone", "Celular").width(120.),
+                Column::new("status", "Estado").width(95.).sortable(),
+                Column::new("biometric", "Huella").width(115.).sortable(),
+                Column::new("credit", "A favor").width(125.).sortable(),
+                Column::new("debt", "En contra").width(125.).sortable(),
+                Column::new("actions", "Acciones").width(220.).selectable(false),
+            ],
+            rows: Vec::new(),
+            can_update: false,
+            can_enroll: false,
+            enrollment_busy: false,
+            sort: None,
+        }
+    }
+
+    pub fn sync(
+        &mut self,
+        state: &AppState,
+        search_query: &str,
+        filter: Filter,
+        enrollment_busy: bool,
+        revealed_balances: &std::collections::HashSet<(u32, bool)>,
+    ) -> bool {
+        let can_update = allowed(state, "pensioners.update");
+        let can_enroll = allowed(state, "biometrics.enroll");
+        let query = search_query.trim().to_lowercase();
+
+        let mut new_rows = Vec::new();
+        if let DataStatus::Ready(data) = &state.data {
+            for person in &data.pensioners {
+                if (filter == Filter::Active && !person.active)
+                    || (filter == Filter::Inactive && person.active)
+                {
+                    continue;
+                }
+                let haystack = format!(
+                    "{} {} {}",
+                    person.id,
+                    person.name(),
+                    person.phone.as_deref().unwrap_or("")
+                )
+                .to_lowercase();
+                if !haystack.contains(&query) {
+                    continue;
+                }
+                let id = person.id;
+                let net = data.net_balance(id);
+                let debt_cents = net.max(0);
+                let credit_cents = net.saturating_neg().max(0);
+                new_rows.push(PensionerTableRow {
+                    id,
+                    name: person.name(),
+                    phone: person.phone.clone().unwrap_or_else(|| "—".into()),
+                    active: person.active,
+                    biometric_status: person.biometric_status(),
+                    has_fp: person.fingerprint_registered || person.biometric_id.is_some(),
+                    credit_cents,
+                    debt_cents,
+                    credit_revealed: revealed_balances.contains(&(id, true)),
+                    debt_revealed: revealed_balances.contains(&(id, false)),
+                });
+            }
+        }
+
+        if let Some((col_ix, sort)) = self.sort {
+            Self::sort_rows(&mut new_rows, col_ix, sort);
+        }
+
+        if new_rows == self.rows
+            && can_update == self.can_update
+            && can_enroll == self.can_enroll
+            && enrollment_busy == self.enrollment_busy
+        {
+            return false;
+        }
+
+        self.rows = new_rows;
+        self.can_update = can_update;
+        self.can_enroll = can_enroll;
+        self.enrollment_busy = enrollment_busy;
+        true
+    }
+
+    fn sort_rows(rows: &mut [PensionerTableRow], col_ix: usize, sort: ColumnSort) {
+        if sort == ColumnSort::Default {
+            rows.sort_by_key(|r| r.id);
+            return;
+        }
+        rows.sort_by(|a, b| {
+            let ord = match col_ix {
+                0 => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
+                2 => b.active.cmp(&a.active),
+                3 => a.biometric_status.cmp(b.biometric_status),
+                4 => a.credit_cents.cmp(&b.credit_cents),
+                5 => a.debt_cents.cmp(&b.debt_cents),
+                _ => a.id.cmp(&b.id),
+            };
+            match sort {
+                ColumnSort::Descending => ord.reverse(),
+                _ => ord,
+            }
+        });
+    }
+}
+
+impl TableDelegate for PensionersTableDelegate {
+    fn columns_count(&self, _: &App) -> usize {
+        self.columns.len()
+    }
+
+    fn rows_count(&self, _: &App) -> usize {
+        self.rows.len()
+    }
+
+    fn column(&self, col_ix: usize, _: &App) -> Column {
+        self.columns[col_ix].clone()
+    }
+
+    fn perform_sort(
+        &mut self,
+        col_ix: usize,
+        sort: ColumnSort,
+        _: &mut Window,
+        cx: &mut Context<TableState<Self>>,
+    ) {
+        self.sort = if sort == ColumnSort::Default {
+            None
+        } else {
+            Some((col_ix, sort))
+        };
+        for (ix, col) in self.columns.iter_mut().enumerate() {
+            if ix == col_ix {
+                col.sort = Some(sort);
+            } else if col.sort.is_some() {
+                col.sort = Some(ColumnSort::Default);
+            }
+        }
+        Self::sort_rows(&mut self.rows, col_ix, sort);
+        cx.notify();
+    }
+
+    fn render_td(
+        &mut self,
+        row_ix: usize,
+        col_ix: usize,
+        _: &mut Window,
+        cx: &mut Context<TableState<Self>>,
+    ) -> impl IntoElement {
+        let Some(row) = self.rows.get(row_ix) else {
+            return div().into_any_element();
+        };
+        let id = row.id;
+        match col_ix {
+            0 => div()
+                .h_full()
+                .flex()
+                .items_center()
+                .text_sm()
+                .truncate()
+                .child(row.name.clone())
+                .into_any_element(),
+            1 => div()
+                .h_full()
+                .flex()
+                .items_center()
+                .text_sm()
+                .truncate()
+                .child(row.phone.clone())
+                .into_any_element(),
+            2 => div()
+                .h_full()
+                .flex()
+                .items_center()
+                .child(status_tag(row.active))
+                .into_any_element(),
+            3 => div()
+                .h_full()
+                .flex()
+                .items_center()
+                .child(biometric_tag(row.biometric_status))
+                .into_any_element(),
+            4 => div()
+                .h_full()
+                .flex()
+                .items_center()
+                .child(balance_cell(
+                    id,
+                    true,
+                    row.credit_cents,
+                    row.credit_revealed,
+                    &self.app,
+                    cx,
+                ))
+                .into_any_element(),
+            5 => div()
+                .h_full()
+                .flex()
+                .items_center()
+                .child(balance_cell(
+                    id,
+                    false,
+                    row.debt_cents,
+                    row.debt_revealed,
+                    &self.app,
+                    cx,
+                ))
+                .into_any_element(),
+            6 => {
+                let app_detail = self.app.clone();
+                let app_edit = self.app.clone();
+                let app_toggle = self.app.clone();
+                let app_bio = self.app.clone();
+                let is_active = row.active;
+                let has_fp = row.has_fp;
+                let enrollment_busy = self.enrollment_busy;
+                h_flex()
+                    .h_full()
+                    .items_center()
+                    .gap_1p5()
+                    .child(
+                        Button::new(format!("person-detail-{id}"))
+                            .outline()
+                            .small()
+                            .icon(LucideIcon::Eye)
+                            .label("Detalle")
+                            .on_click(move |_, _, cx| {
+                                let _ = app_detail.update(cx, |this, cx| {
+                                    this.selected_pensioner = Some(id);
+                                    cx.notify();
+                                });
+                            }),
+                    )
+                    .when(self.can_update, |this| {
+                        this.child(
+                            Button::new(format!("person-edit-{id}"))
+                                .ghost()
+                                .small()
+                                .icon(LucideIcon::Pencil)
+                                .tooltip("Editar")
+                                .on_click(move |_, window, cx| {
+                                    let _ = app_edit.update(cx, |this, cx| {
+                                        this.pensioner_form(Some(id), window, cx);
+                                    });
+                                }),
+                        )
+                        .child(
+                            Button::new(format!("person-toggle-{id}"))
+                                .ghost()
+                                .small()
+                                .icon(if is_active {
+                                    LucideIcon::UserX
+                                } else {
+                                    LucideIcon::UserCheck
+                                })
+                                .tooltip(if is_active {
+                                    "Desactivar"
+                                } else {
+                                    "Activar"
+                                })
+                                .on_click(move |_, window, cx| {
+                                    let _ = app_toggle.update(cx, |this, cx| {
+                                        this.confirm_change(id, window, cx);
+                                    });
+                                }),
+                        )
+                    })
+                    .when(self.can_enroll, |this| {
+                        this.child(
+                            Button::new(format!("person-bio-{id}"))
+                                .ghost()
+                                .small()
+                                .disabled(!is_active || has_fp || enrollment_busy)
+                                .icon(LucideIcon::FingerprintPattern)
+                                .accessibility_label("Registrar huella")
+                                .tooltip(if has_fp {
+                                    "Este pensionista ya tiene una huella registrada"
+                                } else if enrollment_busy {
+                                    "Hay un enrolamiento en curso"
+                                } else if !is_active {
+                                    "Activa al pensionista para gestionar su huella"
+                                } else {
+                                    "Registrar huella"
+                                })
+                                .on_click(move |_, window, cx| {
+                                    let _ = app_bio.update(cx, |this, cx| {
+                                        this.open_biometric_enroll_modal(id, window, cx);
+                                    });
+                                }),
+                        )
+                    })
+                    .into_any_element()
+            }
+            _ => div().into_any_element(),
+        }
+    }
+}
+
 pub fn render(
     state: &AppState,
     cx: &Context<DesktopApp>,
@@ -1244,7 +1777,7 @@ pub fn render(
     search: &Entity<InputState>,
     filter: Filter,
     selected: Option<u32>,
-    enrollment_busy: bool,
+    table_state: &Entity<TableState<PensionersTableDelegate>>,
 ) -> impl IntoElement {
     let theme = app.theme();
     let data = match &state.data {
@@ -1266,121 +1799,7 @@ pub fn render(
     if let Some(person) = selected.and_then(|id| data.pensioners.iter().find(|p| p.id == id)) {
         return details(person, data, state, cx, app).into_any_element();
     }
-    let query = search.read(app).value().to_lowercase();
-    let mut rows = v_flex();
-    let mut count = 0;
-    for person in &data.pensioners {
-        if (filter == Filter::Active && !person.active)
-            || (filter == Filter::Inactive && person.active)
-        {
-            continue;
-        }
-        let haystack = format!(
-            "{} {} {}",
-            person.id,
-            person.name(),
-            person.phone.as_deref().unwrap_or("")
-        )
-        .to_lowercase();
-        if !haystack.contains(query.trim()) {
-            continue;
-        }
-        count += 1;
-        let id = person.id;
-        let balance = data.balance(id);
-        rows = rows.child(
-            h_flex()
-                .gap_3()
-                .px_4()
-                .py_3()
-                .border_t_1()
-                .border_color(theme.border)
-                .child(text_cell(format!("#{id}"), 55.))
-                .child(text_cell(person.name(), 200.))
-                .child(text_cell(
-                    person.phone.clone().unwrap_or_else(|| "—".into()),
-                    115.,
-                ))
-                .child(div().w(px(90.)).flex_shrink_0().child(status_tag(person.active)))
-                .child(
-                    div()
-                        .w(px(105.))
-                        .flex_shrink_0()
-                        .child(biometric_tag(person.biometric_status())),
-                )
-                .child(text_cell(amount(balance), 95.))
-                .child(
-                    h_flex()
-                        .gap_1p5()
-                        .child(
-                            Button::new(format!("person-detail-{id}"))
-                                .outline()
-                                .small()
-                                .icon(LucideIcon::Eye)
-                                .label("Detalle")
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.selected_pensioner = Some(id);
-                                    cx.notify();
-                                })),
-                        )
-                        .when(allowed(state, "pensioners.update"), |this| {
-                            let is_active = person.active;
-                            this.child(
-                                Button::new(format!("person-edit-{id}"))
-                                    .ghost()
-                                    .small()
-                                    .icon(LucideIcon::Pencil)
-                                    .tooltip("Editar")
-                                    .on_click(cx.listener(move |this, _, window, cx| {
-                                        this.pensioner_form(Some(id), window, cx)
-                                    })),
-                            )
-                            .child(
-                                Button::new(format!("person-toggle-{id}"))
-                                    .ghost()
-                                    .small()
-                                    .icon(if is_active {
-                                        LucideIcon::UserX
-                                    } else {
-                                        LucideIcon::UserCheck
-                                    })
-                                    .tooltip(if is_active {
-                                        "Desactivar"
-                                    } else {
-                                        "Activar"
-                                    })
-                                    .on_click(cx.listener(move |this, _, window, cx| {
-                                        this.confirm_change(id, window, cx)
-                                    })),
-                            )
-                        })
-                        .when(allowed(state, "biometrics.enroll"), |this| {
-                            let has_fp = person.fingerprint_registered || person.biometric_id.is_some();
-                            let is_active = person.active;
-                            this.child(
-                                Button::new(format!("person-bio-{id}"))
-                                    .ghost()
-                                    .small()
-                                    .disabled(!is_active || has_fp || enrollment_busy)
-                                    .icon(LucideIcon::FingerprintPattern)
-                                    .accessibility_label("Registrar huella")
-                                    .tooltip(if has_fp {
-                                        "Este pensionista ya tiene una huella registrada"
-                                    } else if enrollment_busy {
-                                        "Hay un enrolamiento en curso"
-                                    } else if !is_active {
-                                        "Activa al pensionista para gestionar su huella"
-                                    } else {
-                                        "Registrar huella"
-                                    })
-                                    .on_click(cx.listener(move |this, _, window, cx| {
-                                        this.open_biometric_enroll_modal(id, window, cx)
-                                    })),
-                            )
-                        }),
-                ),
-        );
-    }
+    let rows_count = table_state.read(app).delegate().rows_count(app);
     let mut filters = h_flex().gap_2().flex_wrap();
     for (choice, label) in [
         (Filter::All, "Todos"),
@@ -1448,7 +1867,7 @@ pub fn render(
                 )
                 .child(filters),
         )
-        .child(if count == 0 {
+        .child(if rows_count == 0 {
             Empty::new()
                 .py_8()
                 .header(
@@ -1466,33 +1885,16 @@ pub fn render(
                 )
                 .into_any_element()
         } else {
+            let table_height = ((rows_count as f32) * 44.0 + 48.0).clamp(220.0, 520.0);
             div()
-                .rounded(theme.radius_lg)
-                .border_1()
-                .border_color(theme.border)
-                .bg(theme.colors.list)
-                .overflow_x_scrollbar()
+                .w_full()
+                .h(px(table_height))
                 .child(
-                    v_flex()
-                        .min_w(px(890.))
-                        .child(
-                            h_flex()
-                                .gap_3()
-                                .px_4()
-                                .py_3()
-                                .bg(theme.colors.table_head)
-                                .text_xs()
-                                .font_weight(FontWeight::SEMIBOLD)
-                                .text_color(theme.muted_foreground)
-                                .child(text_cell("ID", 55.))
-                                .child(text_cell("Nombre completo", 200.))
-                                .child(text_cell("Celular", 115.))
-                                .child(text_cell("Estado", 90.))
-                                .child(text_cell("Huella", 105.))
-                                .child(text_cell("Saldo", 95.))
-                                .child(text_cell("Acciones", 180.)),
-                        )
-                        .child(rows),
+                    DataTable::new(table_state)
+                        .stripe(true)
+                        .bordered(true)
+                        .with_size(Size::Medium)
+                        .accessibility_label("Tabla de pensionistas"),
                 )
                 .into_any_element()
         })

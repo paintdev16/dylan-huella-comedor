@@ -173,6 +173,22 @@ pub struct PaymentReportRow {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TicketReportRow {
+    pub movement_id: String,
+    pub date: NaiveDate,
+    pub time: String,
+    pub pensioner_id: u32,
+    pub pensioner_name: String,
+    pub pensioner_active: bool,
+    pub ticket_count: u32,
+    pub unit_cents: i64,
+    pub total_cents: i64,
+    pub consumption_cents: Option<i64>,
+    pub resulting_balance_cents: Option<i64>,
+    pub operator_name: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DebtReportRow {
     pub pensioner_id: u32,
     pub pensioner_name: String,
@@ -224,6 +240,7 @@ pub struct ReportTotals {
 pub struct ReportsSnapshot {
     pub consumptions: Vec<ConsumptionReportRow>,
     pub payments: Vec<PaymentReportRow>,
+    pub tickets: Vec<TicketReportRow>,
     pub debts: Vec<DebtReportRow>,
     pub daily_summary: Vec<PeriodSummaryRow>,
     pub monthly_summary: Vec<PeriodSummaryRow>,
@@ -393,6 +410,7 @@ impl ReportsDataSource for MockReportsDataSource<'_> {
             });
         }
 
+        let mut tickets = Vec::new();
         for p in &self.data.payments {
             if !matches_date(p.date, filter.date_from, filter.date_to) {
                 continue;
@@ -420,7 +438,6 @@ impl ReportsDataSource for MockReportsDataSource<'_> {
             let (cash_delta, t_count, t_cents) = match &p.kind {
                 crate::mock_data::PaymentKind::CashPayment => (p.cents, 0, 0),
                 crate::mock_data::PaymentKind::TicketCredit { count, .. } => (0, *count, p.cents),
-                crate::mock_data::PaymentKind::AuthorizedDiscount { .. } => (0, 0, 0),
             };
             totals.total_cash_paid_cents += cash_delta;
             totals.total_ticket_count += t_count;
@@ -447,6 +464,31 @@ impl ReportsDataSource for MockReportsDataSource<'_> {
             m_row.cash_paid_cents += cash_delta;
             m_row.ticket_count += t_count;
             m_row.ticket_cents += t_cents;
+
+            if let crate::mock_data::PaymentKind::TicketCredit { count, unit_cents } = p.kind {
+                let mov = self
+                    .data
+                    .cash_register
+                    .movements
+                    .iter()
+                    .find(|m| m.id == p.movement_id);
+                tickets.push(TicketReportRow {
+                    movement_id: p.movement_id.clone(),
+                    date: p.date,
+                    time: p.time.to_string(),
+                    pensioner_id: person.id,
+                    pensioner_name: p_name.clone(),
+                    pensioner_active: person.active,
+                    ticket_count: count,
+                    unit_cents,
+                    total_cents: p.cents,
+                    consumption_cents: mov.and_then(|m| m.consumption_cents),
+                    resulting_balance_cents: mov.and_then(|m| m.resulting_balance_cents),
+                    operator_name: mov
+                        .map(|m| m.operator_name.clone())
+                        .unwrap_or_else(|| "Sistema".into()),
+                });
+            }
 
             payments.push(PaymentReportRow {
                 movement_id: p.movement_id.clone(),
@@ -500,9 +542,12 @@ impl ReportsDataSource for MockReportsDataSource<'_> {
             });
         }
 
+        tickets.sort_by(|a, b| b.date.cmp(&a.date).then_with(|| b.time.cmp(&a.time)));
+
         ReportsSnapshot {
             consumptions,
             payments,
+            tickets,
             debts,
             daily_summary: daily_map.into_values().rev().collect(),
             monthly_summary: monthly_map.into_values().rev().collect(),

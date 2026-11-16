@@ -11,7 +11,7 @@ use gpui_kit::{
         button::{Button, ButtonVariants as _},
         group_box::{GroupBox, GroupBoxVariants as _},
         h_flex,
-        input::{Input, InputState},
+        input::{Input, InputEvent, InputState},
         notification::Notification,
         searchable_list::SearchableListItem,
         select::{Select, SelectEvent, SelectState},
@@ -32,6 +32,7 @@ use crate::{
         BiometricError, BiometricEvent, BiometricReaderState, ContinuousBiometricSignal,
         IdentificationOutcome,
     },
+    components::common::{SemanticTone, info_panel},
     layout::DesktopApp,
     mock_data::{parse_price_cents, DraftConsumptionItem, Meal, MenuKind, MockData},
     state::{AppState, DataStatus, Page},
@@ -135,12 +136,26 @@ struct AutoModalState {
     portions: u32,
     third_party: bool,
     ticket_count: u32,
+    ticket_input_valid: bool,
     cart: Vec<DraftConsumptionItem>,
     next_item_id: u64,
     error: Option<String>,
     submitting: bool,
     token: u64,
     _meal_subscription: Option<Subscription>,
+    _ticket_subscription: Option<Subscription>,
+}
+
+fn parse_ticket_count(raw: &str, unit_cents: i64) -> Result<u32, &'static str> {
+    let value = raw.trim();
+    if value.is_empty() || !value.bytes().all(|b| b.is_ascii_digit()) {
+        return Err("Ingresa una cantidad entera de tickets, igual o mayor a cero.");
+    }
+    let count: u32 = value.parse().map_err(|_| "La cantidad de tickets es demasiado grande.")?;
+    if count > 0 && (unit_cents <= 0 || i64::from(count).checked_mul(unit_cents).is_none()) {
+        return Err("No se puede calcular el importe para esa cantidad de tickets.");
+    }
+    Ok(count)
 }
 
 /// Normaliza texto para búsqueda insensible a mayúsculas y acentos.
@@ -170,8 +185,6 @@ pub struct GlobalPensionerChoice {
     pub id: u32,
     pub full_name: String,
     pub phone: Option<String>,
-    pub biometric_id: Option<String>,
-    pub balance_cents: i64,
     pub search_haystack: String,
 }
 
@@ -179,13 +192,10 @@ impl SearchableListItem for GlobalPensionerChoice {
     type Value = u32;
 
     fn title(&self) -> SharedString {
-        format!(
-            "{} · ID #{} · Saldo: {}",
-            self.full_name,
-            self.id,
-            amount(self.balance_cents)
-        )
-        .into()
+        match self.phone.as_deref().filter(|phone| !phone.trim().is_empty()) {
+            Some(phone) => format!("{} · {phone}", self.full_name).into(),
+            None => self.full_name.clone().into(),
+        }
     }
 
     fn render(&self, _: &mut Window, app: &mut App) -> impl IntoElement {
@@ -206,25 +216,17 @@ impl SearchableListItem for GlobalPensionerChoice {
                             .truncate()
                             .child(self.full_name.clone()),
                     )
-                    .child(div().text_xs().text_color(theme.muted_foreground).child(
-                        match &self.phone {
-                            Some(ph) if !ph.trim().is_empty() => {
-                                format!("ID #{} · {}", self.id, ph)
-                            }
-                            _ => format!("ID #{}", self.id),
+                    .when_some(
+                        self.phone.clone().filter(|ph| !ph.trim().is_empty()),
+                        |this, ph| {
+                            this.child(
+                                div()
+                                    .text_xs()
+                                    .text_color(theme.muted_foreground)
+                                    .child(ph),
+                            )
                         },
-                    )),
-            )
-            .child(
-                div()
-                    .text_xs()
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .text_color(if self.balance_cents > 0 {
-                        theme.warning
-                    } else {
-                        theme.muted_foreground
-                    })
-                    .child(format!("Saldo: {}", amount(self.balance_cents))),
+                    ),
             )
     }
 
@@ -266,8 +268,6 @@ pub fn build_global_pensioner_choices(data: &MockData) -> Vec<GlobalPensionerCho
                 id: p.id,
                 full_name,
                 phone: p.phone.clone(),
-                biometric_id: p.biometric_id.clone(),
-                balance_cents: data.balance(p.id),
                 search_haystack,
             }
         })
@@ -324,9 +324,8 @@ impl DesktopApp {
             BiometricEvent::FingerPlaced => "Dedo colocado en el lector".into(),
             BiometricEvent::FingerRemoved => "Dedo retirado del lector".into(),
             BiometricEvent::Enrolled {
-                pensioner_id,
-                biometric_id,
-            } => format!("Enrolado #{pensioner_id} ({biometric_id})").into(),
+                biometric_id, ..
+            } => format!("Enrolado ({biometric_id})").into(),
             BiometricEvent::OperationCancelled => "Operación cancelada -> Esperando huella".into(),
         };
         self.biometric_event_log.insert(0, label);
@@ -479,7 +478,7 @@ impl DesktopApp {
                             app.push_biometric_event(evt_r);
                             app.pending_biometric_notice = Some((
                                 false,
-                                format!("Pensionista #{pensioner_id} reconocido.").into(),
+                                "Pensionista reconocido.".into(),
                             ));
                         }
                     }
@@ -607,7 +606,7 @@ impl DesktopApp {
         if !active {
             window.push_notification(
                 Notification::warning(format!(
-                    "El pensionista {name} (#{pensioner_id}) está inactivo y no puede registrar consumos."
+                    "El pensionista {name} está inactivo y no puede registrar consumos."
                 )),
                 cx,
             );
@@ -721,7 +720,7 @@ impl DesktopApp {
         if !active {
             window.push_notification(
                 Notification::error(format!(
-                    "El pensionista {person_name} (#{pensioner_id}) está inactivo."
+                    "El pensionista {person_name} está inactivo."
                 )),
                 cx,
             );
@@ -750,6 +749,7 @@ impl DesktopApp {
         });
         let third_party_input =
             cx.new(|cx| InputState::new(window, cx).placeholder("Nombre de quien recoge"));
+        let ticket_input = cx.new(|cx| InputState::new(window, cx).default_value("0"));
 
         let initial_token = self.consumption_confirm_token;
         self.consumption_confirm_token = self.consumption_confirm_token.wrapping_add(1);
@@ -760,15 +760,29 @@ impl DesktopApp {
             portions: 1,
             third_party: false,
             ticket_count: 0,
+            ticket_input_valid: true,
             cart: Vec::new(),
             next_item_id: 1,
             error: None,
             submitting: false,
             token: initial_token,
             _meal_subscription: None,
+            _ticket_subscription: None,
         });
 
         let modal_for_meal = modal_state.clone();
+        let modal_for_ticket_input = modal_state.downgrade();
+        let ticket_sub = cx.subscribe(&ticket_input, move |_this, input, event: &InputEvent, cx| {
+            if matches!(event, InputEvent::Change) {
+                let parsed = parse_ticket_count(&input.read(cx).value(), ticket_unit_cents);
+                let _ = modal_for_ticket_input.update(cx, |state, cx| {
+                    state.ticket_input_valid = parsed.is_ok();
+                    if let Ok(count) = parsed { state.ticket_count = count; }
+                    state.error = None;
+                    cx.notify();
+                });
+            }
+        });
         let meal_sub = cx.subscribe(
             &meal_select,
             move |_this, _select, event: &SelectEvent<Vec<&'static str>>, cx| {
@@ -788,6 +802,7 @@ impl DesktopApp {
         );
         modal_state.update(cx, |s, _| {
             s._meal_subscription = Some(meal_sub);
+            s._ticket_subscription = Some(ticket_sub);
         });
 
         self.pending_global_search_clear = true;
@@ -801,6 +816,7 @@ impl DesktopApp {
             let portions = st.portions;
             let third_party = st.third_party;
             let ticket_count = st.ticket_count;
+            let ticket_input_valid = st.ticket_input_valid;
             let error_msg = st.error.clone();
             let submitting = st.submitting;
             let econ_unit_cents = pricing.economic_for(meal);
@@ -825,10 +841,14 @@ impl DesktopApp {
             let modal_for_ticket_dec = modal_state.clone();
             let modal_for_ticket_inc = modal_state.clone();
             let modal_for_ticket_zero = modal_state.clone();
+            let ticket_for_zero = ticket_input.clone();
+            let ticket_for_dec = ticket_input.clone();
+            let ticket_for_inc = ticket_input.clone();
             let modal_for_submit = modal_state.clone();
 
             let sp_price_add = special_price_input.clone();
             let third_input_submit = third_party_input.clone();
+            let ticket_input_submit = ticket_input.clone();
             let app_submit = app_weak.clone();
             let app_cancel_btn = app_weak.clone();
             let app_close_cb = app_on_cancel.clone();
@@ -836,6 +856,9 @@ impl DesktopApp {
             dialog
                 .width(px(560.))
                 .title(format!("Atención automática · {person_name}"))
+                .close_button(true)
+                .overlay_closable(false)
+                .keyboard(false)
                 .on_cancel(move |_, _, cx| {
                     let _ = app_close_cb.update(cx, |app, cx| {
                         app.resume_waiting_after_modal(cx);
@@ -864,11 +887,6 @@ impl DesktopApp {
                                                         .text_sm()
                                                         .font_weight(FontWeight::BOLD)
                                                         .child(person_name.clone()),
-                                                )
-                                                .child(
-                                                    Tag::secondary()
-                                                        .small()
-                                                        .child(format!("ID #{pensioner_id}")),
                                                 )
                                                 .child(
                                                     Tag::info()
@@ -1265,12 +1283,14 @@ impl DesktopApp {
                                                             .ghost()
                                                             .xsmall()
                                                             .label("Solo deuda")
-                                                            .on_click(move |_, _, cx| {
+                                                            .on_click(move |_, window, cx| {
                                                                 modal_for_ticket_zero.update(cx, |s, cx| {
                                                                     s.ticket_count = 0;
+                                                                    s.ticket_input_valid = true;
                                                                     s.error = None;
                                                                     cx.notify();
                                                                 });
+                                                                ticket_for_zero.update(cx, |input, cx| input.set_value("0", window, cx));
                                                             }),
                                                     )
                                                 })
@@ -1280,38 +1300,47 @@ impl DesktopApp {
                                                         .xsmall()
                                                         .disabled(ticket_count == 0)
                                                         .label("-")
-                                                        .on_click(move |_, _, cx| {
-                                                            modal_for_ticket_dec.update(cx, |s, cx| {
+                                                        .on_click(move |_, window, cx| {
+                                                            let count = modal_for_ticket_dec.update(cx, |s, cx| {
                                                                 s.ticket_count = s.ticket_count.saturating_sub(1);
+                                                                s.ticket_input_valid = true;
                                                                 s.error = None;
                                                                 cx.notify();
+                                                                s.ticket_count
                                                             });
+                                                            ticket_for_dec.update(cx, |input, cx| input.set_value(count.to_string(), window, cx));
                                                         }),
                                                 )
                                                 .child(
-                                                    div()
-                                                        .w(px(24.))
-                                                        .text_center()
-                                                        .text_xs()
-                                                        .font_weight(FontWeight::BOLD)
-                                                        .child(ticket_count.to_string()),
+                                                    div().w(px(80.)).child(
+                                                        Input::new(&ticket_input)
+                                                            .xsmall()
+                                                            .aria_label("Cantidad de tickets físicos entregados")
+                                                    ),
                                                 )
                                                 .child(
                                                     Button::new("auto-ticket-inc")
                                                         .outline()
                                                         .xsmall()
-                                                        .disabled(ticket_unit_cents <= 0)
+                                                        .disabled(ticket_unit_cents <= 0 || ticket_count == u32::MAX || i64::from(ticket_count.saturating_add(1)).checked_mul(ticket_unit_cents).is_none())
                                                         .label("+")
-                                                        .on_click(move |_, _, cx| {
-                                                            modal_for_ticket_inc.update(cx, |s, cx| {
+                                                        .on_click(move |_, window, cx| {
+                                                            let count = modal_for_ticket_inc.update(cx, |s, cx| {
                                                                 s.ticket_count = s.ticket_count.saturating_add(1);
+                                                                s.ticket_input_valid = true;
                                                                 s.error = None;
                                                                 cx.notify();
+                                                                s.ticket_count
                                                             });
+                                                            ticket_for_inc.update(cx, |input, cx| input.set_value(count.to_string(), window, cx));
                                                         }),
                                                 ),
                                         ),
                                 )
+                                .when(!ticket_input_valid, |this| this.child(
+                                    div().text_xs().text_color(cx.theme().danger)
+                                        .child("Ingresa una cantidad entera válida de tickets."),
+                                ))
                                 .when(tickets_need_open_cash, |this| {
                                     this.child(
                                         div()
@@ -1344,7 +1373,19 @@ impl DesktopApp {
                                         .child(
                                             div()
                                                 .text_xs()
-                                                .child(format!("Total raciones: {total_portions}")),
+                                                .text_color(cx.theme().muted_foreground)
+                                                .child(if net_balance > 0 {
+                                                    format!("Deuda anterior: {}", amount(net_balance))
+                                                } else if net_balance < 0 {
+                                                    format!("Saldo a favor anterior: {}", amount(-net_balance))
+                                                } else {
+                                                    "Saldo anterior: S/ 0.00".to_string()
+                                                }),
+                                        )
+                                        .child(
+                                            div()
+                                                .text_xs()
+                                                .child(format!("Consumo actual ({total_portions} rac.): {}", amount(total_cents))),
                                         )
                                         .child(
                                             div()
@@ -1352,12 +1393,12 @@ impl DesktopApp {
                                                 .text_color(cx.theme().muted_foreground)
                                                 .child(if ticket_count > 0 {
                                                     format!(
-                                                        "Tickets ({ticket_count} × {}): {}",
+                                                        "Tickets recibidos: {ticket_count} × {} = {}",
                                                         amount(ticket_unit_cents),
                                                         amount(tickets_value_cents)
                                                     )
                                                 } else {
-                                                    "Tickets: 0 (S/ 0.00 abonados)".to_string()
+                                                    "Tickets recibidos: 0 (S/ 0.00)".to_string()
                                                 }),
                                         ),
                                 )
@@ -1369,7 +1410,11 @@ impl DesktopApp {
                                             div()
                                                 .text_base()
                                                 .font_weight(FontWeight::BOLD)
-                                                .child(format!("Consumo: {}", amount(total_cents))),
+                                                .child(if ticket_count > 0 && total_cents == 0 {
+                                                    format!("Abono: {}", amount(tickets_value_cents))
+                                                } else {
+                                                    format!("Consumo: {}", amount(total_cents))
+                                                }),
                                         )
                                         .child(
                                             div()
@@ -1381,11 +1426,11 @@ impl DesktopApp {
                                                     cx.theme().primary
                                                 })
                                                 .child(if final_net_balance < 0 {
-                                                    format!("Saldo final: A favor {}", amount(final_credit_cents))
+                                                    format!("Saldo resultante: A favor {}", amount(final_credit_cents))
                                                 } else if final_net_balance > 0 {
-                                                    format!("Saldo final: Deuda {}", amount(final_debt_cents))
+                                                    format!("Saldo resultante: Deuda {}", amount(final_debt_cents))
                                                 } else {
-                                                    "Saldo final: S/ 0.00 (Al día)".to_string()
+                                                    "Saldo resultante: S/ 0.00 (Al día)".to_string()
                                                 }),
                                         ),
                                 ),
@@ -1411,35 +1456,48 @@ impl DesktopApp {
                                 .primary()
                                 .disabled(
                                     submitting
-                                        || total_portions == 0
+                                        || !ticket_input_valid
+                                        || (total_portions == 0 && ticket_count == 0)
                                         || tickets_need_open_cash,
                                 )
                                 .label("Confirmar atención")
                                 .on_click(move |_, window, cx| {
                                     let pickup_name =
                                         third_input_submit.read(cx).value().trim().to_string();
-                                    let (already_submitting, items, is_third, tickets, token) = {
+                                    let (already_submitting, items, is_third, token) = {
                                         let s = modal_for_submit.read(cx);
                                         (
                                             s.submitting,
                                             s.cart.clone(),
                                             s.third_party,
-                                            s.ticket_count,
                                             s.token,
                                         )
                                     };
                                     if already_submitting {
                                         return;
                                     }
-                                    if items.is_empty() {
+                                    let tickets = match parse_ticket_count(&ticket_input_submit.read(cx).value(), ticket_unit_cents) {
+                                        Ok(count) => count,
+                                        Err(message) => {
+                                            modal_for_submit.update(cx, |s, cx| {
+                                                s.ticket_input_valid = false;
+                                                s.error = Some(message.into());
+                                                cx.notify();
+                                            });
+                                            return;
+                                        }
+                                    };
+                                    if items.is_empty() && tickets == 0 {
                                         modal_for_submit.update(cx, |s, cx| {
-                                            s.error =
-                                                Some("Agrega al menos un consumo al carrito.".into());
+                                            s.error = Some(
+                                                "Agrega al menos un consumo o un ticket físico."
+                                                    .into(),
+                                            );
                                             cx.notify();
                                         });
                                         return;
                                     }
-                                    if is_third && pickup_name.chars().count() < 2 {
+                                    if !items.is_empty() && is_third && pickup_name.chars().count() < 2 {
                                         modal_for_submit.update(cx, |s, cx| {
                                             s.error =
                                                 Some("Ingresa el nombre de quien recoge.".into());
@@ -1447,13 +1505,20 @@ impl DesktopApp {
                                         });
                                         return;
                                     }
-                                    let pickup = is_third.then_some(pickup_name);
+                                    let pickup = (!items.is_empty() && is_third).then_some(pickup_name);
 
                                     modal_for_submit.update(cx, |s, _| s.submitting = true);
 
                                     let res = app_submit.update(cx, |app, cx| {
-                                        if !allowed(&app.state, "consumptions.create") {
+                                        if !items.is_empty() && !allowed(&app.state, "consumptions.create") {
                                             return Err("No tienes permiso para registrar consumos.".to_string());
+                                        }
+                                        if items.is_empty()
+                                            && tickets > 0
+                                            && !allowed(&app.state, "payments.create")
+                                            && !allowed(&app.state, "consumptions.create")
+                                        {
+                                            return Err("No tienes permiso para registrar tickets físicos.".to_string());
                                         }
                                         let now = chrono::Local::now();
                                         let date = now.date_naive();
@@ -1461,20 +1526,35 @@ impl DesktopApp {
                                         let operator = app.state.user.name.to_string();
                                         let out = match &mut app.state.data {
                                             DataStatus::Ready(data) => {
-                                                let res = data.record_consumptions_with_tickets(
-                                                    date,
-                                                    &time,
-                                                    pensioner_id,
-                                                    &items,
-                                                    pickup.as_deref(),
-                                                    tickets,
-                                                    token,
-                                                    &mut app.consumption_processed_tokens,
-                                                );
-                                                if let Ok((_, Some(ref mov_id), _)) = res {
-                                                    data.set_movement_operator(mov_id, &operator);
+                                                if items.is_empty() {
+                                                    let mov_res = data.record_ticket_credit(
+                                                        date,
+                                                        &time,
+                                                        pensioner_id,
+                                                        tickets,
+                                                        token,
+                                                        &mut app.consumption_processed_tokens,
+                                                    );
+                                                    mov_res.map(|mov_id| {
+                                                        data.set_movement_operator(&mov_id, &operator);
+                                                        (0usize, Some(mov_id), data.net_balance(pensioner_id))
+                                                    })
+                                                } else {
+                                                    let res = data.record_consumptions_with_tickets(
+                                                        date,
+                                                        &time,
+                                                        pensioner_id,
+                                                        &items,
+                                                        pickup.as_deref(),
+                                                        tickets,
+                                                        token,
+                                                        &mut app.consumption_processed_tokens,
+                                                    );
+                                                    if let Ok((_, Some(ref mov_id), _)) = res {
+                                                        data.set_movement_operator(mov_id, &operator);
+                                                    }
+                                                    res
                                                 }
-                                                res
                                             }
                                             _ => Err("Los datos no están disponibles.".into()),
                                         };
@@ -1485,6 +1565,22 @@ impl DesktopApp {
                                     });
 
                                     match res {
+                                        Ok(Ok((0, Some(mov_id), final_net))) => {
+                                            window.close_dialog(cx);
+                                            let balance_msg = if final_net < 0 {
+                                                format!("saldo a favor {}", amount(-final_net))
+                                            } else if final_net > 0 {
+                                                format!("deuda final {}", amount(final_net))
+                                            } else {
+                                                "al día".to_string()
+                                            };
+                                            window.push_notification(
+                                                Notification::success(format!(
+                                                    "Tickets registrados ({tickets} und. · {mov_id} · {balance_msg}). Lector listo para la siguiente huella."
+                                                )),
+                                                cx,
+                                            );
+                                        }
                                         Ok(Ok((count, Some(mov_id), final_net))) => {
                                             window.close_dialog(cx);
                                             let balance_msg = if final_net < 0 {
@@ -1549,15 +1645,21 @@ pub fn render(
     let is_identifying = matches!(reader_state, BiometricReaderState::Identifying);
     let can_identify = allowed(state, "biometrics.identify");
     let sim_disabled = !is_connected || is_identifying || modal_open || !can_identify;
-    let (ring_color, icon_color) = match reader_state {
-        BiometricReaderState::Disconnected => (theme.border, theme.muted_foreground),
-        BiometricReaderState::Connected => (theme.info, theme.info),
-        BiometricReaderState::WaitingFingerprint => (theme.primary, theme.primary),
-        BiometricReaderState::Identifying => (theme.info, theme.info),
-        BiometricReaderState::Identified { .. } => (theme.success, theme.success),
-        BiometricReaderState::Unrecognized => (theme.warning, theme.warning),
-        BiometricReaderState::Error(_) => (theme.danger, theme.danger),
+    let reader_tone = match reader_state {
+        BiometricReaderState::Disconnected => SemanticTone::Neutral,
+        BiometricReaderState::Connected => SemanticTone::Blue,
+        BiometricReaderState::WaitingFingerprint => SemanticTone::Amber,
+        BiometricReaderState::Identifying => SemanticTone::Blue,
+        BiometricReaderState::Identified { .. } => SemanticTone::Green,
+        BiometricReaderState::Unrecognized => SemanticTone::Amber,
+        BiometricReaderState::Error(_) => SemanticTone::Red,
     };
+    let reader_palette = reader_tone.palette(app);
+    let (ring_color, icon_color, ring_bg) = (
+        reader_palette.border,
+        reader_palette.icon,
+        reader_palette.icon_bg,
+    );
 
     let identified_person = match (reader_state, &state.data) {
         (
@@ -1570,7 +1672,7 @@ pub fn render(
             .pensioners
             .iter()
             .find(|p| p.id == *pensioner_id)
-            .map(|p| (p, biometric_id.clone(), data.balance(p.id))),
+            .map(|p| (p, biometric_id.clone(), data.net_balance(p.id))),
         _ => None,
     };
 
@@ -1655,7 +1757,7 @@ pub fn render(
                                         .rounded_full()
                                         .border_2()
                                         .border_color(ring_color)
-                                        .bg(theme.muted)
+                                        .bg(ring_bg)
                                         .flex()
                                         .items_center()
                                         .justify_center()
@@ -1775,60 +1877,67 @@ pub fn render(
                                 .title("Última identificación")
                                 .child(if let Some((person, bio_id, balance)) = identified_person {
                                     let pid = person.id;
-                                    v_flex()
-                                        .gap_3()
+                                    info_panel(SemanticTone::Green, app)
                                         .child(
-                                            h_flex()
-                                                .gap_2()
-                                                .flex_wrap()
+                                            v_flex()
+                                                .gap_3()
+                                                .child(
+                                                    h_flex()
+                                                        .gap_2()
+                                                        .flex_wrap()
+                                                        .child(
+                                                            div()
+                                                                .text_lg()
+                                                                .font_weight(FontWeight::BOLD)
+                                                                .child(person.name()),
+                                                        )
+                                                        .child(Tag::info().outline().small().child(bio_id)),
+                                                )
                                                 .child(
                                                     div()
-                                                        .text_lg()
-                                                        .font_weight(FontWeight::BOLD)
-                                                        .child(person.name()),
-                                                )
-                                                .child(Tag::secondary().small().child(format!("ID #{pid}")))
-                                                .child(Tag::info().outline().small().child(bio_id)),
-                                        )
-                                        .child(
-                                            div()
-                                                .text_sm()
-                                                .text_color(theme.muted_foreground)
-                                                .child(format!(
-                                                    "Estado: {} · Saldo pendiente: {}",
-                                                    if person.active { "Activo" } else { "Inactivo" },
-                                                    amount(balance)
-                                                )),
-                                        )
-                                        .child(
-                                            h_flex()
-                                                .gap_2()
-                                                .child(
-                                                    Button::new("bio-open-modal-again")
-                                                        .primary()
-                                                        .small()
-                                                        .icon(LucideIcon::Utensils)
-                                                        .label("Abrir modal de consumo")
-                                                        .on_click(cx.listener(move |this, _, window, cx| {
-                                                            this.open_manual_consumption_modal(pid, window, cx);
-                                                        })),
+                                                        .text_sm()
+                                                        .text_color(theme.muted_foreground)
+                                                        .child(format!(
+                                                            "Estado: {} · {}",
+                                                            if person.active { "Activo" } else { "Inactivo" },
+                                                            if balance < 0 {
+                                                                format!("Saldo a favor: {}", amount(-balance))
+                                                            } else if balance > 0 {
+                                                                format!("Deuda pendiente: {}", amount(balance))
+                                                            } else {
+                                                                "Al día (S/ 0.00)".to_string()
+                                                            }
+                                                        )),
                                                 )
                                                 .child(
-                                                    Button::new("bio-view-pensioner")
-                                                        .outline()
-                                                        .small()
-                                                        .icon(LucideIcon::Eye)
-                                                        .label("Ver ficha")
-                                                        .on_click(cx.listener(move |this, _, _, cx| {
-                                                            this.selected_pensioner = Some(pid);
-                                                            this.navigate_to(Page::Pensionistas, cx);
-                                                        })),
+                                                    h_flex()
+                                                        .gap_2()
+                                                        .child(
+                                                            Button::new("bio-open-modal-again")
+                                                                .primary()
+                                                                .small()
+                                                                .icon(LucideIcon::Utensils)
+                                                                .label("Abrir modal de consumo")
+                                                                .on_click(cx.listener(move |this, _, window, cx| {
+                                                                    this.open_manual_consumption_modal(pid, window, cx);
+                                                                })),
+                                                        )
+                                                        .child(
+                                                            Button::new("bio-view-pensioner")
+                                                                .outline()
+                                                                .small()
+                                                                .icon(LucideIcon::Eye)
+                                                                .label("Ver ficha")
+                                                                .on_click(cx.listener(move |this, _, _, cx| {
+                                                                    this.selected_pensioner = Some(pid);
+                                                                    this.navigate_to(Page::Pensionistas, cx);
+                                                                })),
+                                                        ),
                                                 ),
                                         )
                                         .into_any_element()
                                 } else {
-                                    div()
-                                        .py_4()
+                                    info_panel(SemanticTone::Neutral, app)
                                         .text_sm()
                                         .text_color(theme.muted_foreground)
                                         .child("Esperando lectura biométrica automática.")
@@ -1984,5 +2093,17 @@ mod tests {
         assert!(item.matches("955123"));
         assert!(!item.matches("inexistente"));
         assert!(item.matches("luci\u{301}a go\u{301}mez"));
+    }
+
+    #[test]
+    fn ticket_count_requires_a_valid_nonnegative_integer() {
+        assert_eq!(parse_ticket_count("0", 700), Ok(0));
+        assert_eq!(parse_ticket_count(" 11 ", 700), Ok(11));
+        assert_eq!(parse_ticket_count("20", 700), Ok(20));
+        for value in ["", "-1", "1.5", "abc", "4294967296"] {
+            assert!(parse_ticket_count(value, 700).is_err());
+        }
+        assert!(parse_ticket_count("2", i64::MAX).is_err());
+        assert!(parse_ticket_count("1", 0).is_err());
     }
 }

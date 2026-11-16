@@ -18,6 +18,7 @@ use gpui_kit::{
 };
 
 use crate::{
+    components::common::{SemanticTone, metric_card},
     layout::DesktopApp,
     mock_data::{CashMovementKind, parse_price_cents},
     state::{AppState, DataStatus, Page},
@@ -36,7 +37,6 @@ pub enum CashOpKind {
     #[default]
     Payment,
     Tickets,
-    Discount,
 }
 
 fn allowed(state: &AppState, permission: &str) -> bool {
@@ -60,7 +60,6 @@ fn movement_tag(kind: CashMovementKind) -> Tag {
         CashMovementKind::Closing => Tag::secondary().small().child(label),
         CashMovementKind::Payment => Tag::success().small().child(label),
         CashMovementKind::TicketCredit => Tag::info().small().child(label),
-        CashMovementKind::Discount => Tag::warning().small().child(label),
     }
 }
 
@@ -393,7 +392,7 @@ impl DesktopApp {
         let ticket_count = self.cash_ticket_count.max(1);
         let ticket_unit = data.cash_register.ticket_value_cents;
 
-        let (op_cents, op_summary, reason) = match op_kind {
+        let (op_cents, op_summary) = match op_kind {
             CashOpKind::Payment => {
                 let raw = self.cash_amount_input.read(cx).value().to_string();
                 let cents = match parse_price_cents(&raw) {
@@ -419,7 +418,7 @@ impl DesktopApp {
                 } else {
                     "Pago parcial"
                 };
-                (cents, format!("{kind_lbl} de {}", amount(cents)), String::new())
+                (cents, format!("{kind_lbl} de {}", amount(cents)))
             }
             CashOpKind::Tickets => {
                 let total = ticket_unit.saturating_mul(ticket_count as i64);
@@ -431,46 +430,6 @@ impl DesktopApp {
                         amount(ticket_unit),
                         amount(total)
                     ),
-                    String::new(),
-                )
-            }
-            CashOpKind::Discount => {
-                let raw = self.cash_amount_input.read(cx).value().to_string();
-                let cents = match parse_price_cents(&raw) {
-                    Ok(c) => c,
-                    Err(err) => {
-                        window.push_notification(Notification::error(err), cx);
-                        return;
-                    }
-                };
-                if cents > debt {
-                    window.push_notification(
-                        Notification::error(format!(
-                            "El descuento ({}) no puede superar la deuda pendiente ({}).",
-                            amount(cents),
-                            amount(debt)
-                        )),
-                        cx,
-                    );
-                    return;
-                }
-                let reason = self
-                    .cash_discount_reason_input
-                    .read(cx)
-                    .value()
-                    .trim()
-                    .to_string();
-                if reason.chars().count() < 3 {
-                    window.push_notification(
-                        Notification::error("Ingresa el motivo o autorización del descuento."),
-                        cx,
-                    );
-                    return;
-                }
-                (
-                    cents,
-                    format!("Descuento autorizado de {} ({reason})", amount(cents)),
-                    reason,
                 )
             }
         };
@@ -499,7 +458,6 @@ impl DesktopApp {
             let app = app.clone();
             let summary_text = op_summary.clone();
             let p_name = person_name.clone();
-            let reason_submit = reason.clone();
             let op_name = operator_preview.clone();
             let hall_name = dining_hall.clone();
             let r_date = receipt_date.clone();
@@ -512,7 +470,7 @@ impl DesktopApp {
                         .child(
                             div()
                                 .text_sm()
-                                .child(format!("Pensionista: {p_name} (ID #{pid})")),
+                                .child(format!("Pensionista: {p_name}")),
                         )
                         .child(div().text_sm().font_weight(FontWeight::SEMIBOLD).child(summary_text.clone()))
                         .child(
@@ -577,7 +535,6 @@ impl DesktopApp {
                                 .primary()
                                 .label("Confirmar movimiento")
                                 .on_click(move |_, window, cx| {
-                                    let reason_val = reason_submit.clone();
                                     let res = app.update(cx, |this, cx| {
                                         if this.cash_submitting {
                                             return Err(
@@ -587,13 +544,15 @@ impl DesktopApp {
                                         }
                                         this.cash_submitting = true;
                                         let operator = this.state.user.name.to_string();
+                                        let now = chrono::Local::now();
                                         let date = this.state.dashboard_date;
+                                        let time = now.format("%H:%M").to_string();
                                         let out = match &mut this.state.data {
                                             DataStatus::Ready(data) => {
                                                 let mov_res = match op_kind {
                                                     CashOpKind::Payment => data.record_payment(
                                                         date,
-                                                        "14:20",
+                                                        &time,
                                                         pid,
                                                         op_cents,
                                                         token,
@@ -601,18 +560,9 @@ impl DesktopApp {
                                                     ),
                                                     CashOpKind::Tickets => data.record_ticket_credit(
                                                         date,
-                                                        "14:20",
+                                                        &time,
                                                         pid,
                                                         ticket_count,
-                                                        token,
-                                                        &mut this.cash_processed_tokens,
-                                                    ),
-                                                    CashOpKind::Discount => data.record_discount(
-                                                        date,
-                                                        "14:20",
-                                                        pid,
-                                                        op_cents,
-                                                        &reason_val,
                                                         token,
                                                         &mut this.cash_processed_tokens,
                                                     ),
@@ -641,10 +591,6 @@ impl DesktopApp {
                                             this.cash_amount_input.update(cx, |input, cx| {
                                                 input.set_value(next_text, window, cx);
                                             });
-                                            this.cash_discount_reason_input.update(
-                                                cx,
-                                                |input, cx| input.set_value("", window, cx),
-                                            );
                                             cx.notify();
                                         }
                                         out
@@ -695,7 +641,7 @@ impl DesktopApp {
         let person_label = mov
             .pensioner_id
             .and_then(|pid| data.pensioners.iter().find(|p| p.id == pid))
-            .map(|p| format!("{} (ID #{})", p.name(), p.id))
+            .map(|p| p.name())
             .unwrap_or_else(|| "Operación de caja".to_string());
         let remaining_balance = mov.pensioner_id.map(|pid| data.balance(pid));
         let dining_hall = self.preferences.dining_hall_name.clone();
@@ -795,22 +741,15 @@ impl DesktopApp {
     }
 }
 
-fn kpi_box(label: &'static str, value: String, app: &App) -> impl IntoElement {
-    let theme = app.theme();
-    div()
-        .flex_1()
-        .min_w(px(170.))
-        .p_3p5()
-        .rounded(theme.radius_lg)
-        .border_1()
-        .border_color(theme.border)
-        .bg(theme.colors.list)
-        .child(
-            v_flex()
-                .gap_1()
-                .child(div().text_xs().text_color(theme.muted_foreground).child(label))
-                .child(div().text_xl().font_weight(FontWeight::BOLD).child(value)),
-        )
+fn kpi_box(
+    label: &'static str,
+    value: String,
+    detail: impl Into<gpui_kit::SharedString>,
+    icon: LucideIcon,
+    tone: SemanticTone,
+    app: &App,
+) -> impl IntoElement {
+    metric_card(label, value, Some(detail.into()), icon, tone, app)
 }
 
 pub fn render(
@@ -832,6 +771,7 @@ pub fn render(
     let is_open = data.cash_register.is_open;
     let ticket_unit = data.cash_register.ticket_value_cents;
     let total_debt: i64 = data.pensioners.iter().map(|p| data.balance(p.id)).sum();
+    let total_credit: i64 = data.pensioners.iter().map(|p| data.credit_balance(p.id)).sum();
     let expected_cash = data.cash_register.opening_cents + data.cash_inflow_cents();
     let (total_tickets_count, total_tickets_cents) = data.total_tickets();
 
@@ -889,7 +829,7 @@ pub fn render(
                             div()
                                 .text_sm()
                                 .text_color(theme.muted_foreground)
-                                .child("Pagos completos/parciales, tickets físicos, descuentos y arqueo simulado"),
+                                .child("Pagos completos o parciales, tickets físicos y arqueo simulado"),
                         ),
                 )
                 .child(
@@ -928,7 +868,7 @@ pub fn render(
             this.child(
                 Alert::warning(
                     "cash-closed-banner",
-                    "La caja está cerrada. Abre la caja para registrar pagos, tickets o descuentos.",
+                    "La caja está cerrada. Abre la caja para registrar pagos o tickets.",
                 )
                 .title("Caja cerrada"),
             )
@@ -937,15 +877,54 @@ pub fn render(
             h_flex()
                 .gap_3()
                 .flex_wrap()
-                .child(kpi_box("Apertura de caja", amount(data.cash_register.opening_cents), app))
-                .child(kpi_box("Cobros en efectivo", amount(data.cash_inflow_cents()), app))
                 .child(kpi_box(
-                    "Tickets recibidos",
-                    format!("{total_tickets_count} und. · {}", amount(total_tickets_cents)),
+                    "Apertura de caja",
+                    amount(data.cash_register.opening_cents),
+                    "Fondo inicial de sesión",
+                    LucideIcon::Wallet,
+                    SemanticTone::Neutral,
                     app,
                 ))
-                .child(kpi_box("Saldo esperado en caja", amount(expected_cash), app))
-                .child(kpi_box("Deuda total pendiente", amount(total_debt), app)),
+                .child(kpi_box(
+                    "Cobros en efectivo",
+                    amount(data.cash_inflow_cents()),
+                    "Ingresos en efectivo",
+                    LucideIcon::Wallet,
+                    SemanticTone::Green,
+                    app,
+                ))
+                .child(kpi_box(
+                    "Tickets recibidos",
+                    format!("{total_tickets_count} und."),
+                    format!("Equivalente: {}", amount(total_tickets_cents)),
+                    LucideIcon::Ticket,
+                    SemanticTone::Blue,
+                    app,
+                ))
+                .child(kpi_box(
+                    "Saldo esperado en caja",
+                    amount(expected_cash),
+                    "Apertura + efectivo",
+                    LucideIcon::ShieldCheck,
+                    SemanticTone::Violet,
+                    app,
+                ))
+                .child(kpi_box(
+                    "Saldo total a favor",
+                    amount(total_credit),
+                    "Excedentes de pensionistas",
+                    LucideIcon::Wallet,
+                    SemanticTone::SoftGreen,
+                    app,
+                ))
+                .child(kpi_box(
+                    "Deuda total pendiente",
+                    amount(total_debt),
+                    "Por cobrar a pensionistas",
+                    LucideIcon::Wallet,
+                    SemanticTone::SoftRed,
+                    app,
+                )),
         )
         .child(
             h_flex()
@@ -993,7 +972,7 @@ pub fn render(
                                         .children(filtered_pensioners.into_iter().map(|p| {
                                             let pid = p.id;
                                             let consumed = data.consumed_total(pid);
-                                            let bal = data.balance(pid);
+                                            let bal = data.net_balance(pid);
                                             let is_sel = app_view.cash_selected_pensioner == Some(pid);
                                             h_flex()
                                                 .justify_between()
@@ -1013,7 +992,7 @@ pub fn render(
                                                             div()
                                                                 .text_sm()
                                                                 .font_weight(FontWeight::MEDIUM)
-                                                                .child(format!("#{pid} · {}", p.name())),
+                                                                .child(p.name()),
                                                         )
                                                         .child(
                                                             div()
@@ -1065,6 +1044,8 @@ pub fn render(
                                     let consumed = data.consumed_total(pid);
                                     let paid = data.paid_total(pid);
                                     let debt = data.balance(pid);
+                                    let credit = data.credit_balance(pid);
+                                    let (p_tkt_count, p_tkt_cents) = data.tickets_for_pensioner(pid);
                                     let ticket_total = ticket_unit
                                         .saturating_mul(app_view.cash_ticket_count.max(1) as i64);
 
@@ -1083,24 +1064,51 @@ pub fn render(
                                                             div()
                                                                 .text_sm()
                                                                 .font_weight(FontWeight::BOLD)
-                                                                .child(format!("#{pid} · {}", person.name())),
+                                                                .child(person.name()),
                                                         )
                                                         .child(
                                                             div()
                                                                 .text_xs()
                                                                 .text_color(theme.muted_foreground)
                                                                 .child(format!(
-                                                                    "Consumido: {} · Abonado: {}",
+                                                                    "Consumido: {} · Abonado: {} (Tickets: {} und. = {})",
                                                                     amount(consumed),
-                                                                    amount(paid)
+                                                                    amount(paid),
+                                                                    p_tkt_count,
+                                                                    amount(p_tkt_cents)
                                                                 )),
                                                         ),
                                                 )
                                                 .child(
-                                                    div()
-                                                        .text_xl()
-                                                        .font_weight(FontWeight::BOLD)
-                                                        .child(amount(debt)),
+                                                    v_flex()
+                                                        .items_end()
+                                                        .child(
+                                                            div()
+                                                                .text_xs()
+                                                                .text_color(theme.muted_foreground)
+                                                                .child(if credit > 0 {
+                                                                    "Saldo a favor"
+                                                                } else {
+                                                                    "Deuda pendiente"
+                                                                }),
+                                                        )
+                                                        .child(
+                                                            div()
+                                                                .text_xl()
+                                                                .font_weight(FontWeight::BOLD)
+                                                                .text_color(if credit > 0 {
+                                                                    theme.primary
+                                                                } else if debt > 0 {
+                                                                    theme.warning
+                                                                } else {
+                                                                    theme.foreground
+                                                                })
+                                                                .child(if credit > 0 {
+                                                                    amount(credit)
+                                                                } else {
+                                                                    amount(debt)
+                                                                }),
+                                                        ),
                                                 ),
                                         )
                                         .child(
@@ -1108,7 +1116,6 @@ pub fn render(
                                                 [
                                                     (CashOpKind::Payment, "Pago"),
                                                     (CashOpKind::Tickets, "Tickets físicos"),
-                                                    (CashOpKind::Discount, "Descuento"),
                                                 ]
                                                 .into_iter()
                                                 .map(|(kind, lbl)| {
@@ -1211,26 +1218,6 @@ pub fn render(
                                                     ),
                                             )
                                         })
-                                        .when(app_view.cash_op_kind == CashOpKind::Discount, |this| {
-                                            this.child(
-                                                v_flex()
-                                                    .gap_2()
-                                                    .child(
-                                                        div()
-                                                            .text_xs()
-                                                            .text_color(theme.muted_foreground)
-                                                            .child("Monto del descuento (S/) *"),
-                                                    )
-                                                    .child(Input::new(&app_view.cash_amount_input))
-                                                    .child(
-                                                        div()
-                                                            .text_xs()
-                                                            .text_color(theme.muted_foreground)
-                                                            .child("Motivo / autorización *"),
-                                                    )
-                                                    .child(Input::new(&app_view.cash_discount_reason_input)),
-                                            )
-                                        })
                                         .child(
                                             h_flex().justify_end().child(
                                                 Button::new("cash-register-op-btn")
@@ -1255,7 +1242,7 @@ pub fn render(
                                         .py_4()
                                         .text_sm()
                                         .text_color(theme.muted_foreground)
-                                        .child("Selecciona un pensionista para registrar pagos, tickets o descuentos.")
+                                        .child("Selecciona un pensionista para registrar pagos o tickets.")
                                         .into_any_element()
                                 }),
                         )
@@ -1295,11 +1282,10 @@ pub fn render(
                                                                     .text_xs()
                                                                     .text_color(theme.muted_foreground)
                                                                     .child(format!(
-                                                                        "Consumos: {} · Pagos: {} · Tickets: {} · Desc.: {}",
+                                                                        "Consumos: {} · Pagos: {} · Tickets: {}",
                                                                         amount(m.consumed_cents),
                                                                         amount(m.cash_paid_cents),
-                                                                        amount(m.tickets_cents),
-                                                                        amount(m.discounts_cents)
+                                                                        amount(m.tickets_cents)
                                                                     )),
                                                             ),
                                                     )

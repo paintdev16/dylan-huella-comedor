@@ -1,4 +1,5 @@
 use crate::{
+    components::common::{SemanticTone, metric_card},
     layout::DesktopApp,
     mock_data,
     state::{AppState, DataStatus, Page},
@@ -27,24 +28,15 @@ fn column(value: impl Into<gpui_kit::SharedString>, width: f32) -> impl IntoElem
         .truncate()
         .child(value.into())
 }
-fn summary(label: &'static str, value: String, app: &App) -> impl IntoElement {
-    let theme = app.theme();
-    v_flex()
-        .flex_1()
-        .min_w(px(180.))
-        .gap_2()
-        .p_4()
-        .rounded(theme.radius_lg)
-        .border_1()
-        .border_color(theme.border)
-        .bg(theme.colors.list)
-        .child(
-            div()
-                .text_sm()
-                .text_color(theme.muted_foreground)
-                .child(label),
-        )
-        .child(div().text_2xl().font_weight(FontWeight::BOLD).child(value))
+fn summary(
+    label: &'static str,
+    value: String,
+    detail: &'static str,
+    icon: LucideIcon,
+    tone: SemanticTone,
+    app: &App,
+) -> impl IntoElement {
+    metric_card(label, value, Some(detail.into()), icon, tone, app)
 }
 
 pub fn render(state: &AppState, cx: &Context<DesktopApp>, app: &App) -> impl IntoElement {
@@ -92,7 +84,7 @@ pub fn render(state: &AppState, cx: &Context<DesktopApp>, app: &App) -> impl Int
                     .iter()
                     .find(|p| p.id == item.pensioner_id)
                     .map(|p| p.name())
-                    .unwrap_or_else(|| format!("Pensionista #{}", item.pensioner_id));
+                    .unwrap_or_else(|| "Pensionista desconocido".into());
                 let detail = match (&item.detail, &item.picked_up_by) {
                     (Some(d), Some(p)) => format!("{d} · Recogido por {p}"),
                     (Some(d), None) => d.clone(),
@@ -126,10 +118,27 @@ pub fn render(state: &AppState, cx: &Context<DesktopApp>, app: &App) -> impl Int
                         .child(summary(
                             "Consumos registrados",
                             records.len().to_string(),
+                            "Atenciones registradas hoy",
+                            LucideIcon::Utensils,
+                            SemanticTone::Blue,
                             app,
                         ))
-                        .child(summary("Raciones entregadas", portions.to_string(), app))
-                        .child(summary("Importe consumido", money(total_cents), app)),
+                        .child(summary(
+                            "Raciones entregadas",
+                            portions.to_string(),
+                            "Unidades entregadas hoy",
+                            LucideIcon::Utensils,
+                            SemanticTone::Orange,
+                            app,
+                        ))
+                        .child(summary(
+                            "Importe consumido",
+                            money(total_cents),
+                            "Total acumulado hoy",
+                            LucideIcon::Wallet,
+                            SemanticTone::Neutral,
+                            app,
+                        )),
                 )
                 .child(
                     v_flex()

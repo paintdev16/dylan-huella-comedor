@@ -23,6 +23,7 @@ use gpui_kit::{
 
 use crate::{
     biometric_service::BiometricReaderState,
+    components::common::{SemanticTone, info_panel},
     layout::DesktopApp,
     mock_data::parse_price_cents,
     pages::identification::{MealSchedule, SimulationMode, allowed, state_tag},
@@ -709,16 +710,18 @@ pub fn render(
                                         .child(Input::new(&app_view.cfg_station_id_input)),
                                 ),
                         )
-                        .child(
-                            h_flex()
+                        .child({
+                            let server_tone = match &app_view.server_status {
+                                ServerConnectionStatus::Untested => SemanticTone::Neutral,
+                                ServerConnectionStatus::Testing => SemanticTone::Blue,
+                                ServerConnectionStatus::Connected(_) => SemanticTone::Green,
+                                ServerConnectionStatus::Failed(_) => SemanticTone::SoftRed,
+                            };
+                            info_panel(server_tone, app_cx)
+                                .flex()
                                 .justify_between()
                                 .gap_3()
                                 .flex_wrap()
-                                .p_3()
-                                .rounded(theme.radius)
-                                .border_1()
-                                .border_color(theme.border)
-                                .bg(theme.muted)
                                 .child(
                                     v_flex()
                                         .gap_0p5()
@@ -747,8 +750,8 @@ pub fn render(
                                                     this.save_server_settings(window, cx);
                                                 })),
                                         ),
-                                ),
-                        ),
+                                )
+                        }),
                 ),
         )
         .child(
@@ -797,18 +800,25 @@ pub fn render(
                                         })),
                                 ),
                         )
-                        .child(
+                        .child({
+                            let reader_tone = match reader_state {
+                                BiometricReaderState::Disconnected => SemanticTone::Neutral,
+                                BiometricReaderState::Connected
+                                | BiometricReaderState::Identifying => SemanticTone::Blue,
+                                BiometricReaderState::WaitingFingerprint
+                                | BiometricReaderState::Unrecognized => SemanticTone::Amber,
+                                BiometricReaderState::Identified { .. } => SemanticTone::Green,
+                                BiometricReaderState::Error(_) => SemanticTone::SoftRed,
+                            };
+                            let tpl_palette = SemanticTone::Violet.palette(app_cx);
+                            let sdk_palette = SemanticTone::Blue.palette(app_cx);
                             h_flex()
                                 .gap_3()
                                 .flex_wrap()
                                 .child(
-                                    div()
+                                    info_panel(reader_tone, app_cx)
                                         .flex_1()
                                         .min_w(px(220.))
-                                        .p_3()
-                                        .rounded(theme.radius)
-                                        .border_1()
-                                        .border_color(theme.border)
                                         .child(
                                             v_flex()
                                                 .gap_1()
@@ -817,36 +827,28 @@ pub fn render(
                                         ),
                                 )
                                 .child(
-                                    div()
+                                    info_panel(SemanticTone::Violet, app_cx)
                                         .flex_1()
                                         .min_w(px(200.))
-                                        .p_3()
-                                        .rounded(theme.radius)
-                                        .border_1()
-                                        .border_color(theme.border)
                                         .child(
                                             v_flex()
                                                 .gap_1()
                                                 .child(div().text_xs().text_color(theme.muted_foreground).child("Plantillas registradas"))
-                                                .child(div().text_sm().font_weight(FontWeight::BOLD).child(format!("{template_count} plantilla(s)"))),
+                                                .child(div().text_sm().font_weight(FontWeight::BOLD).text_color(tpl_palette.value).child(format!("{template_count} plantilla(s)"))),
                                         ),
                                 )
                                 .child(
-                                    div()
+                                    info_panel(SemanticTone::Blue, app_cx)
                                         .flex_1()
                                         .min_w(px(220.))
-                                        .p_3()
-                                        .rounded(theme.radius)
-                                        .border_1()
-                                        .border_color(theme.border)
                                         .child(
                                             v_flex()
                                                 .gap_1()
                                                 .child(div().text_xs().text_color(theme.muted_foreground).child("SDK objetivo"))
-                                                .child(div().text_xs().font_weight(FontWeight::SEMIBOLD).child("SecuGen FDx SDK Pro / SecuSearch Pro")),
+                                                .child(div().text_xs().font_weight(FontWeight::SEMIBOLD).text_color(sdk_palette.value).child("SecuGen FDx SDK Pro / SecuSearch Pro")),
                                         ),
-                                ),
-                        )
+                                )
+                        })
                         .child(
                             div()
                                 .text_xs()

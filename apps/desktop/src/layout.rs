@@ -11,6 +11,7 @@ use gpui_kit::{
         input::{InputEvent, InputState},
         scroll::ScrollableElement as _,
         sidebar::SidebarToggleButton,
+        table::TableState,
         tag::Tag,
         v_flex,
         WindowExt as _,
@@ -64,6 +65,8 @@ pub struct DesktopApp {
     pub(crate) pensioner_search: Entity<InputState>,
     pub(crate) pensioner_filter: crate::pages::pensioners::Filter,
     pub(crate) selected_pensioner: Option<u32>,
+    pub(crate) revealed_pensioner_balances: std::collections::HashSet<(u32, bool)>,
+    pub(crate) pensioners_table: Entity<TableState<crate::pages::pensioners::PensionersTableDelegate>>,
     _search_subscription: Subscription,
     pub(crate) biometric_gateway: Box<dyn BiometricGateway>,
     pub(crate) biometric_event_log: Vec<SharedString>,
@@ -85,7 +88,6 @@ pub struct DesktopApp {
     pub(crate) consumption_processed_tokens: std::collections::HashSet<u64>,
     pub(crate) cash_search: Entity<InputState>,
     pub(crate) cash_amount_input: Entity<InputState>,
-    pub(crate) cash_discount_reason_input: Entity<InputState>,
     pub(crate) cash_filter: crate::pages::cash::CashFilter,
     pub(crate) cash_op_kind: crate::pages::cash::CashOpKind,
     pub(crate) cash_selected_pensioner: Option<u32>,
@@ -154,7 +156,7 @@ impl DesktopApp {
             input.set_masked(true, window, cx);
             input
         });
-        let pensioner_search = cx.new(|cx| InputState::new(window, cx).placeholder("Buscar por nombre, celular o ID"));
+        let pensioner_search = cx.new(|cx| InputState::new(window, cx).placeholder("Buscar por nombre o celular"));
         let search_subscription = cx.subscribe_in(&pensioner_search, window, |_, _, event, _, cx| {
             if matches!(event, InputEvent::Change) { cx.notify(); }
         });
@@ -185,13 +187,12 @@ impl DesktopApp {
             economic_lunch_cents: preferences.economic_lunch_cents,
             special_default_cents: preferences.special_default_cents,
         };
-        let cash_search = cx.new(|cx| InputState::new(window, cx).placeholder("Buscar pensionista por nombre, ID o celular"));
+        let cash_search = cx.new(|cx| InputState::new(window, cx).placeholder("Buscar pensionista por nombre o celular"));
         let cash_search_sub = cx.subscribe_in(&cash_search, window, |_, _, event, _, cx| {
             if matches!(event, InputEvent::Change) { cx.notify(); }
         });
         let cash_amount_input = cx.new(|cx| InputState::new(window, cx).placeholder("0.00"));
-        let cash_discount_reason_input = cx.new(|cx| InputState::new(window, cx).placeholder("Ej. Beca parcial autorizada"));
-        let report_search = cx.new(|cx| InputState::new(window, cx).placeholder("Buscar por pensionista, ID, plato o MOV"));
+        let report_search = cx.new(|cx| InputState::new(window, cx).placeholder("Buscar por pensionista, plato o MOV"));
         let report_search_sub = cx.subscribe_in(&report_search, window, |this, _, event, _, cx| {
             if matches!(event, InputEvent::Change) {
                 this.report_page = 0;
@@ -275,6 +276,18 @@ impl DesktopApp {
             ThemePreference::Light => ThemeMode::Light,
             ThemePreference::Dark => ThemeMode::Dark,
         };
+        let app_weak_for_table = cx.entity().downgrade();
+        let pensioners_table = cx.new(|cx| {
+            TableState::new(
+                crate::pages::pensioners::PensionersTableDelegate::new(app_weak_for_table),
+                window,
+                cx,
+            )
+            .col_resizable(true)
+            .col_movable(false)
+            .row_selectable(true)
+            .sortable(true)
+        });
         let mut app = Self {
             state: initial_state,
             menu_bar,
@@ -289,6 +302,8 @@ impl DesktopApp {
             pensioner_search,
             pensioner_filter: crate::pages::pensioners::Filter::All,
             selected_pensioner: None,
+            revealed_pensioner_balances: std::collections::HashSet::new(),
+            pensioners_table,
             _search_subscription: search_subscription,
             biometric_gateway: Box::new(SimulatedBiometricGateway::new()),
             biometric_event_log: Vec::new(),
@@ -310,7 +325,6 @@ impl DesktopApp {
             consumption_processed_tokens: std::collections::HashSet::new(),
             cash_search,
             cash_amount_input,
-            cash_discount_reason_input,
             cash_filter: crate::pages::cash::CashFilter::WithDebt,
             cash_op_kind: crate::pages::cash::CashOpKind::Payment,
             cash_selected_pensioner: None,
@@ -358,6 +372,7 @@ impl DesktopApp {
     pub fn navigate_to(&mut self, page: Page, cx: &mut Context<Self>) {
         if self.state.auth.user().is_none() { return; }
         if !self.state.auth.can_view(page) { self.denied = true; cx.notify(); return; }
+        if page != Page::Pensionistas { self.revealed_pensioner_balances.clear(); }
         self.denied = false;
         let was_selected = self.selected_pensioner.take().is_some();
         if self.state.push_page(page) || was_selected {
@@ -369,6 +384,7 @@ impl DesktopApp {
         if self.state.auth.user().is_none() { return; }
         self.denied = false;
         if self.state.go_back() {
+            if self.state.page != Page::Pensionistas { self.revealed_pensioner_balances.clear(); }
             cx.notify();
         }
     }
@@ -377,6 +393,7 @@ impl DesktopApp {
         if self.state.auth.user().is_none() { return; }
         self.denied = false;
         if self.state.go_forward() {
+            if self.state.page != Page::Pensionistas { self.revealed_pensioner_balances.clear(); }
             cx.notify();
         }
     }
@@ -434,6 +451,7 @@ impl DesktopApp {
         self.biometric_event_log.clear();
         self.state.auth = AuthStatus::Unauthenticated;
         self.selected_pensioner = None;
+        self.revealed_pensioner_balances.clear();
         self.state.user = Default::default();
         self.denied = false;
         self.state.page = Page::Dashboard;
@@ -596,6 +614,20 @@ impl DesktopApp {
 
 impl Render for DesktopApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.state.page == Page::Pensionistas && self.selected_pensioner.is_none() {
+            let query = self.pensioner_search.read(cx).value().to_string();
+            self.pensioners_table.update(cx, |table, cx| {
+                if table.delegate_mut().sync(
+                    &self.state,
+                    &query,
+                    self.pensioner_filter,
+                    self.biometric_modal_open,
+                    &self.revealed_pensioner_balances,
+                ) {
+                    table.refresh(cx);
+                }
+            });
+        }
         if let Some(pid) = self.pending_auto_modal_pensioner.take() {
             let entity = cx.entity().downgrade();
             window.defer(cx, move |window, cx| {
@@ -815,7 +847,7 @@ impl Render for DesktopApp {
                                             .xsmall()
                                             .icon(LucideIcon::Search)
                                             .placeholder("Buscar pensionista (Ctrl+K)")
-                                            .search_placeholder("Nombre, apellido, celular o #ID…")
+                                            .search_placeholder("Nombre, apellido o celular…")
                                             .menu_width(px(360.))
                                             .cleanable(true)
                                             .disabled(self.biometric_modal_open)

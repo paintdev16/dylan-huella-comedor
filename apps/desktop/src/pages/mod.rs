@@ -29,7 +29,16 @@ pub fn render_page(
     match state.page {
         Page::Dashboard => dashboard::render(state, cx, app_cx).into_any_element(),
         Page::Pensionistas => {
-            pensioners::render(state, cx, app_cx, search, filter, selected, app_view.biometric_modal_open).into_any_element()
+            pensioners::render(
+                state,
+                cx,
+                app_cx,
+                search,
+                filter,
+                selected,
+                &app_view.pensioners_table,
+            )
+            .into_any_element()
         }
         Page::Identificacion => identification::render(
             state,
