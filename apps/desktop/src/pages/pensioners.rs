@@ -1,4 +1,9 @@
+use std::time::Duration;
+
 use crate::{
+    biometric_service::{
+        BiometricEvent, BiometricGateway as _, EnrollmentStep, generate_unique_biometric_id,
+    },
     layout::DesktopApp,
     mock_data::{MockData, Pensioner},
     state::{AppState, DataStatus, Page},
@@ -8,15 +13,18 @@ use gpui_kit::{
     Styled, Window,
     assets::IconName as LucideIcon,
     component::{
-        ActiveTheme as _, Icon, Sizable as _, WindowExt as _,
+        ActiveTheme as _, Disableable as _, Icon, Sizable as _, WindowExt as _,
         alert::Alert,
         button::{Button, ButtonVariants as _},
+        checkbox::Checkbox,
         empty::{Empty, EmptyDescription, EmptyHeader, EmptyMedia, EmptyMediaVariant, EmptyTitle},
         group_box::{GroupBox, GroupBoxVariants as _},
         h_flex,
         input::{Input, InputState},
         notification::Notification,
         scroll::ScrollableElement as _,
+        spinner::Spinner,
+        switch::Switch,
         tag::Tag,
         v_flex,
     },
@@ -67,6 +75,25 @@ fn biometric_tag(status: &str) -> Tag {
     }
 }
 
+#[derive(Clone)]
+struct NewEnrollFormState {
+    enabled: bool,
+    consent_given: bool,
+    step: EnrollmentStep,
+    op_seq: u64,
+}
+
+fn enrollment_tag(step: &EnrollmentStep) -> Tag {
+    match step {
+        EnrollmentStep::Idle => Tag::secondary().small().child("Pendiente"),
+        EnrollmentStep::WaitingFinger => Tag::warning().outline().small().child("Esperando dedo"),
+        EnrollmentStep::Capturing => Tag::info().small().child("Capturando"),
+        EnrollmentStep::Verifying => Tag::info().small().child("Verificando"),
+        EnrollmentStep::Registered { .. } => Tag::success().small().child("Registrada (simulada)"),
+        EnrollmentStep::Error(_) => Tag::danger().small().child("Error"),
+    }
+}
+
 impl DesktopApp {
     fn has_pensioner_permission(&self, permission: &str) -> bool {
         self.state.auth.can_view(Page::Pensionistas) && allowed(&self.state, permission)
@@ -95,6 +122,29 @@ impl DesktopApp {
             window.push_notification(Notification::error("Pensionista no encontrado."), cx);
             return;
         }
+
+        let is_new = id.is_none();
+        let can_enroll = self.has_pensioner_permission("biometrics.enroll");
+        let reader_available = self.biometric_gateway.state().is_connected();
+
+        // Suspende la identificación de consumos durante el enrolamiento de un nuevo pensionista.
+        if is_new && reader_available {
+            self.biometric_modal_open = true;
+            self.biometric_gateway.set_modal_locked(true);
+        }
+
+        let initial_enroll = is_new && can_enroll && reader_available;
+        let enroll_state = cx.new(|_| NewEnrollFormState {
+            enabled: initial_enroll,
+            consent_given: false,
+            step: if initial_enroll {
+                EnrollmentStep::WaitingFinger
+            } else {
+                EnrollmentStep::Idle
+            },
+            op_seq: 0,
+        });
+
         let first = cx.new(|cx| {
             InputState::new(window, cx)
                 .placeholder("Ej. Ana María")
@@ -117,26 +167,53 @@ impl DesktopApp {
         });
         let form_error: Entity<Option<String>> = cx.new(|_| None);
         let app = cx.entity().downgrade();
-        let app_for_enroll_root = app.clone();
+        let app_on_cancel_dlg = app.clone();
+        let app_on_cancel_btn = app.clone();
+        let app_on_save = app.clone();
+
         window.open_dialog(cx, move |dialog, _, cx| {
             let first_field = first.clone();
             let last_field = last.clone();
             let phone_field = phone.clone();
             let form_error_view = form_error.clone();
             let form_error_submit = form_error.clone();
-            let app = app.clone();
-            let app_for_enroll = app_for_enroll_root.clone();
+            let enroll_view = enroll_state.clone();
+            let enroll_switch = enroll_state.clone();
+            let enroll_consent = enroll_state.clone();
+            let enroll_capture = enroll_state.clone();
+            let enroll_fail = enroll_state.clone();
+            let enroll_submit = enroll_state.clone();
+
+            let app_cap = app.clone();
+            let app_save = app_on_save.clone();
+            let app_cancel_dlg = app_on_cancel_dlg.clone();
+            let app_cancel_btn = app_on_cancel_btn.clone();
+
             let current_error = form_error_view.read(cx).clone();
+            let enr = enroll_view.read(cx).clone();
+            let is_busy = matches!(
+                enr.step,
+                EnrollmentStep::Capturing | EnrollmentStep::Verifying
+            );
 
             dialog
+                .width(px(520.))
                 .title(if let Some(pid) = id {
                     format!("Editar pensionista #{pid}")
                 } else {
                     "Nuevo pensionista".to_string()
                 })
+                .on_cancel(move |_, _, cx| {
+                    if is_new {
+                        let _ = app_cancel_dlg.update(cx, |this, cx| {
+                            this.resume_waiting_after_modal(cx);
+                        });
+                    }
+                    true
+                })
                 .child(
                     v_flex()
-                        .gap_4()
+                        .gap_3p5()
                         .when_some(current_error, |this, err| {
                             this.child(Alert::error("pensioner-form-error", err))
                         })
@@ -160,19 +237,19 @@ impl DesktopApp {
                         })
                         .child(
                             v_flex()
-                                .gap_1p5()
+                                .gap_1()
                                 .child(div().text_sm().font_weight(FontWeight::MEDIUM).child("Nombres *"))
                                 .child(Input::new(&first)),
                         )
                         .child(
                             v_flex()
-                                .gap_1p5()
+                                .gap_1()
                                 .child(div().text_sm().font_weight(FontWeight::MEDIUM).child("Apellidos *"))
                                 .child(Input::new(&last)),
                         )
                         .child(
                             v_flex()
-                                .gap_1p5()
+                                .gap_1()
                                 .child(
                                     div()
                                         .text_sm()
@@ -181,12 +258,193 @@ impl DesktopApp {
                                 )
                                 .child(Input::new(&phone)),
                         )
-                        .when(id.is_none(), |this| {
+                        .when(is_new, |this| {
                             this.child(
-                                div()
-                                    .text_xs()
-                                    .text_color(cx.theme().muted_foreground)
-                                    .child("El identificador único se asigna automáticamente y no se puede modificar."),
+                                v_flex()
+                                    .gap_2p5()
+                                    .p_3()
+                                    .rounded(cx.theme().radius)
+                                    .border_1()
+                                    .border_color(cx.theme().border)
+                                    .bg(cx.theme().muted)
+                                    .child(
+                                        h_flex()
+                                            .justify_between()
+                                            .gap_2()
+                                            .child(
+                                                v_flex()
+                                                    .gap_0p5()
+                                                    .child(
+                                                        div()
+                                                            .text_sm()
+                                                            .font_weight(FontWeight::SEMIBOLD)
+                                                            .child("Registrar huella biométrica"),
+                                                    )
+                                                    .child(
+                                                        div()
+                                                            .text_xs()
+                                                            .text_color(cx.theme().muted_foreground)
+                                                            .child(if !can_enroll {
+                                                                "Sin permiso de enrolamiento; se guardará como Pendiente."
+                                                            } else if !reader_available {
+                                                                "Lector no conectado; se guardará como Pendiente (alternativa manual)."
+                                                            } else {
+                                                                "Identificación de consumos suspendida durante la captura."
+                                                            }),
+                                                    ),
+                                            )
+                                            .child(
+                                                Switch::new("new-pensioner-enroll-switch")
+                                                    .checked(enr.enabled)
+                                                    .disabled(!can_enroll || !reader_available || is_busy)
+                                                    .on_change(move |checked: &bool, _, cx| {
+                                                        enroll_switch.update(cx, |s, cx| {
+                                                            s.enabled = *checked;
+                                                            s.op_seq = s.op_seq.wrapping_add(1);
+                                                            s.step = if *checked {
+                                                                EnrollmentStep::WaitingFinger
+                                                            } else {
+                                                                EnrollmentStep::Idle
+                                                            };
+                                                            cx.notify();
+                                                        });
+                                                    }),
+                                            ),
+                                    )
+                                    .when(enr.enabled, |this| {
+                                        this.child(
+                                            Checkbox::new("new-pensioner-consent")
+                                                .checked(enr.consent_given)
+                                                .label("Consentimiento informado otorgado (alternativa: identificación manual)")
+                                                .on_click(move |checked: &bool, _, cx| {
+                                                    enroll_consent.update(cx, |s, cx| {
+                                                        s.consent_given = *checked;
+                                                        cx.notify();
+                                                    });
+                                                }),
+                                        )
+                                        .child(
+                                            h_flex()
+                                                .justify_between()
+                                                .gap_2()
+                                                .child(
+                                                    h_flex()
+                                                        .gap_2()
+                                                        .when(is_busy, |this| {
+                                                            this.child(Spinner::new().small())
+                                                        })
+                                                        .child(enrollment_tag(&enr.step))
+                                                        .when_some(
+                                                            match &enr.step {
+                                                                EnrollmentStep::Registered { biometric_id } => {
+                                                                    Some(format!("Código asignado: {biometric_id}"))
+                                                                }
+                                                                EnrollmentStep::Error(msg) => Some(msg.clone()),
+                                                                _ => None,
+                                                            },
+                                                            |this, text| {
+                                                                this.child(
+                                                                    div()
+                                                                        .text_xs()
+                                                                        .text_color(cx.theme().muted_foreground)
+                                                                        .child(text),
+                                                                )
+                                                            },
+                                                        ),
+                                                )
+                                                .child(
+                                                    h_flex()
+                                                        .gap_1p5()
+                                                        .child(
+                                                            Button::new("new-enroll-sim-capture")
+                                                                .outline()
+                                                                .xsmall()
+                                                                .disabled(!enr.consent_given || is_busy)
+                                                                .icon(LucideIcon::FingerprintPattern)
+                                                                .label(match &enr.step {
+                                                                    EnrollmentStep::Registered { .. } => "Recapturar",
+                                                                    EnrollmentStep::Error(_) => "Reintentar",
+                                                                    _ => "Simular captura",
+                                                                })
+                                                                .on_click(move |_, _, cx| {
+                                                                    let seq = enroll_capture.update(cx, |s, cx| {
+                                                                        s.op_seq = s.op_seq.wrapping_add(1);
+                                                                        s.step = EnrollmentStep::Capturing;
+                                                                        cx.notify();
+                                                                        s.op_seq
+                                                                    });
+                                                                    let enroll_weak = enroll_capture.downgrade();
+                                                                    let app_for_dup = app_cap.clone();
+                                                                    cx.spawn(async move |cx| {
+                                                                        cx.background_spawn(async move {
+                                                                            std::thread::sleep(Duration::from_millis(200));
+                                                                        }).await;
+                                                                        let still_valid = enroll_weak.update(cx, |s, cx| {
+                                                                            if s.op_seq != seq {
+                                                                                return false;
+                                                                            }
+                                                                            s.step = EnrollmentStep::Verifying;
+                                                                            cx.notify();
+                                                                            true
+                                                                        }).unwrap_or(false);
+                                                                        if !still_valid {
+                                                                            return;
+                                                                        }
+                                                                        cx.background_spawn(async move {
+                                                                            std::thread::sleep(Duration::from_millis(220));
+                                                                        }).await;
+                                                                        let candidates = app_for_dup
+                                                                            .read_with(cx, |app, _| match &app.state.data {
+                                                                                DataStatus::Ready(d) => d.biometric_candidates(),
+                                                                                _ => Vec::new(),
+                                                                            })
+                                                                            .unwrap_or_default();
+                                                                        let generated = generate_unique_biometric_id(&candidates);
+                                                                        let _ = enroll_weak.update(cx, |s, cx| {
+                                                                            if s.op_seq != seq {
+                                                                                return;
+                                                                            }
+                                                                            s.step = EnrollmentStep::Registered {
+                                                                                biometric_id: generated,
+                                                                            };
+                                                                            cx.notify();
+                                                                        });
+                                                                    }).detach();
+                                                                }),
+                                                        )
+                                                        .child(
+                                                            Button::new("new-enroll-sim-err")
+                                                                .ghost()
+                                                                .xsmall()
+                                                                .disabled(!enr.consent_given || is_busy)
+                                                                .label("Simular error")
+                                                                .on_click(move |_, _, cx| {
+                                                                    enroll_fail.update(cx, |s, cx| {
+                                                                        s.op_seq = s.op_seq.wrapping_add(1);
+                                                                        s.step = EnrollmentStep::Error(
+                                                                            "Lectura simulada incompleta; reintenta o guarda como Pendiente.".into(),
+                                                                        );
+                                                                        cx.notify();
+                                                                    });
+                                                                }),
+                                                        ),
+                                                ),
+                                        )
+                                        .child(
+                                            div()
+                                                .text_xs()
+                                                .text_color(cx.theme().muted_foreground)
+                                                .child("Simulación por eventos sin lector físico; no registra huella real."),
+                                        )
+                                    })
+                                    .when(!enr.enabled, |this| {
+                                        this.child(
+                                            div()
+                                                .text_xs()
+                                                .text_color(cx.theme().muted_foreground)
+                                                .child("Se guardará con estado biométrico «Pendiente» y podrá usar identificación manual."),
+                                        )
+                                    }),
                             )
                         }),
                 )
@@ -198,17 +456,55 @@ impl DesktopApp {
                             Button::new("pensioner-cancel")
                                 .outline()
                                 .label("Cancelar")
-                                .on_click(|_, window, cx| window.close_dialog(cx)),
+                                .on_click(move |_, window, cx| {
+                                    if is_new {
+                                        let _ = app_cancel_btn.update(cx, |this, cx| {
+                                            this.resume_waiting_after_modal(cx);
+                                        });
+                                    }
+                                    window.close_dialog(cx);
+                                }),
                         )
                         .child(
                             Button::new("pensioner-save")
                                 .primary()
+                                .disabled(is_busy)
                                 .label("Guardar")
                                 .on_click(move |_, window, cx| {
                                     let first = first_field.read(cx).value().to_string();
                                     let last = last_field.read(cx).value().to_string();
                                     let phone = phone_field.read(cx).value().to_string();
-                                    let result = app.update(cx, |this, cx| {
+                                    let enr_snap = enroll_submit.read(cx).clone();
+
+                                    if is_new && enr_snap.enabled {
+                                        if !enr_snap.consent_given {
+                                            let msg = "Marca el consentimiento informado o desactiva «Registrar huella biométrica» para guardar como Pendiente.".to_string();
+                                            form_error_submit.update(cx, |err, cx| {
+                                                *err = Some(msg);
+                                                cx.notify();
+                                            });
+                                            return;
+                                        }
+                                        if !matches!(enr_snap.step, EnrollmentStep::Registered { .. }) {
+                                            let msg = "Completa la captura de huella o desactiva «Registrar huella biométrica» para guardar como Pendiente.".to_string();
+                                            form_error_submit.update(cx, |err, cx| {
+                                                *err = Some(msg);
+                                                cx.notify();
+                                            });
+                                            return;
+                                        }
+                                    }
+
+                                    let captured_bio = match &enr_snap.step {
+                                        EnrollmentStep::Registered { biometric_id }
+                                            if is_new && enr_snap.enabled =>
+                                        {
+                                            Some(biometric_id.clone())
+                                        }
+                                        _ => None,
+                                    };
+
+                                    let result = app_save.update(cx, |this, cx| {
                                         if !this.has_pensioner_permission(permission) {
                                             return Err(
                                                 "No tienes permiso para guardar.".to_string()
@@ -221,27 +517,35 @@ impl DesktopApp {
                                         };
                                         let saved_id =
                                             data.save_pensioner(id, &first, &last, &phone)?;
+                                        if let Some(bio_code) = &captured_bio {
+                                            let registered =
+                                                data.register_fingerprint_with_id(saved_id, bio_code)?;
+                                            this.push_biometric_event(BiometricEvent::Enrolled {
+                                                pensioner_id: saved_id,
+                                                biometric_id: registered,
+                                            });
+                                        }
                                         this.selected_pensioner = Some(saved_id);
-                                        let should_enroll = id.is_none()
-                                            && this.has_pensioner_permission("biometrics.enroll");
+                                        if is_new {
+                                            this.resume_waiting_after_modal(cx);
+                                        }
                                         cx.notify();
-                                        Ok((saved_id, should_enroll))
+                                        Ok(captured_bio.is_some())
                                     });
                                     match result {
-                                        Ok(Ok((saved_id, should_enroll))) => {
+                                        Ok(Ok(with_bio)) => {
                                             form_error_submit.update(cx, |err, _| *err = None);
                                             window.close_dialog(cx);
                                             window.push_notification(
-                                                Notification::success("Pensionista guardado."),
+                                                Notification::success(if with_bio {
+                                                    "Pensionista guardado con huella simulada."
+                                                } else if is_new {
+                                                    "Pensionista guardado en estado Pendiente."
+                                                } else {
+                                                    "Pensionista actualizado."
+                                                }),
                                                 cx,
                                             );
-                                            if should_enroll {
-                                                let _ = app_for_enroll.update(cx, |this, cx| {
-                                                    this.confirm_change(
-                                                        saved_id, true, window, cx,
-                                                    );
-                                                });
-                                            }
                                         }
                                         Ok(Err(error)) => {
                                             form_error_submit.update(cx, |err, cx| {

@@ -5,7 +5,7 @@
 
 pub use biometric::{
     BiometricCandidate, BiometricError, BiometricEvent, BiometricGateway, BiometricReaderState,
-    IdentificationOutcome, SimulatedBiometricGateway,
+    EnrollmentStep, IdentificationOutcome, SimulatedBiometricGateway, generate_unique_biometric_id,
 };
 
 /// Señales de eventos simulados o de dispositivo hacia el monitor continuo.

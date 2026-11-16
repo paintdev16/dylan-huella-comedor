@@ -189,6 +189,48 @@ pub trait BiometricGateway: Send + Sync {
     fn cancel(&mut self) -> BiometricEvent;
 }
 
+/// Estados del flujo guiado de enrolamiento biométrico.
+#[derive(Clone, PartialEq, Eq, Debug, Default)]
+pub enum EnrollmentStep {
+    #[default]
+    Idle,
+    WaitingFinger,
+    Capturing,
+    Verifying,
+    Registered {
+        biometric_id: String,
+    },
+    Error(String),
+}
+
+impl EnrollmentStep {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Idle => "Sin iniciar",
+            Self::WaitingFinger => "Esperando dedo",
+            Self::Capturing => "Capturando",
+            Self::Verifying => "Verificando",
+            Self::Registered { .. } => "Registrada (simulada)",
+            Self::Error(_) => "Error",
+        }
+    }
+}
+
+/// Genera un identificador biométrico único que no colisiona con los existentes.
+pub fn generate_unique_biometric_id(existing: &[BiometricCandidate]) -> String {
+    let mut seq: u32 = 1;
+    loop {
+        let candidate = format!("BIO-{seq:04}");
+        let taken = existing
+            .iter()
+            .any(|c| c.biometric_id.eq_ignore_ascii_case(&candidate));
+        if !taken {
+            return candidate;
+        }
+        seq = seq.saturating_add(1);
+    }
+}
+
 /// Implementación basada en eventos para simular el flujo continuo sin hardware ni DLL.
 #[derive(Debug, Default)]
 pub struct SimulatedBiometricGateway {
@@ -207,17 +249,19 @@ impl SimulatedBiometricGateway {
     }
 
     /// Simula búsqueda 1:N sobre candidatos activos con plantilla registrada.
+    ///
+    /// Si se solicita un `preferred_pensioner_id` específico y no existe o está
+    /// inactivo, devuelve `IdentificationOutcome::NoMatch` sin seleccionar otro.
     pub fn simulate_match(
         candidates: &[BiometricCandidate],
         preferred_pensioner_id: Option<u32>,
     ) -> IdentificationOutcome {
-        let matched = preferred_pensioner_id
-            .and_then(|id| {
-                candidates
-                    .iter()
-                    .find(|c| c.active && c.pensioner_id == id)
-            })
-            .or_else(|| candidates.iter().find(|c| c.active));
+        let matched = match preferred_pensioner_id {
+            Some(id) => candidates
+                .iter()
+                .find(|c| c.active && c.pensioner_id == id),
+            None => candidates.iter().find(|c| c.active),
+        };
 
         match matched {
             Some(c) => IdentificationOutcome::Match {
@@ -412,5 +456,54 @@ mod tests {
 
         let tpl = gw.validate_enrollment(2, "BIO-0002", &existing).unwrap();
         assert_eq!(tpl.biometric_id, "BIO-0002");
+    }
+
+    #[test]
+    fn simulate_match_returns_no_match_when_target_absent_or_inactive() {
+        let candidates = vec![
+            BiometricCandidate {
+                pensioner_id: 1,
+                biometric_id: "BIO-0001".into(),
+                active: true,
+            },
+            BiometricCandidate {
+                pensioner_id: 2,
+                biometric_id: "BIO-0002".into(),
+                active: false,
+            },
+        ];
+
+        assert_eq!(
+            SimulatedBiometricGateway::simulate_match(&candidates, Some(99)),
+            IdentificationOutcome::NoMatch
+        );
+        assert_eq!(
+            SimulatedBiometricGateway::simulate_match(&candidates, Some(2)),
+            IdentificationOutcome::NoMatch
+        );
+        assert_eq!(
+            SimulatedBiometricGateway::simulate_match(&candidates, Some(1)),
+            IdentificationOutcome::Match {
+                pensioner_id: 1,
+                biometric_id: "BIO-0001".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn unique_biometric_id_skips_existing_ids() {
+        let existing = vec![
+            BiometricCandidate {
+                pensioner_id: 1,
+                biometric_id: "BIO-0001".into(),
+                active: true,
+            },
+            BiometricCandidate {
+                pensioner_id: 2,
+                biometric_id: "BIO-0002".into(),
+                active: false,
+            },
+        ];
+        assert_eq!(generate_unique_biometric_id(&existing), "BIO-0003");
     }
 }
