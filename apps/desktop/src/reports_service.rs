@@ -648,8 +648,8 @@ mod tests {
         )
         .unwrap();
 
-        // 3. Registrar pago parcial en Caja
-        data.record_payment(today, "09:00", new_pid, 500, 10, &mut p_tokens)
+        // 3. Registrar un ticket físico en Caja.
+        data.record_ticket_credit(today, "09:00", new_pid, 1, 10, &mut p_tokens)
             .unwrap();
 
         // Dashboard (fecha hoy)

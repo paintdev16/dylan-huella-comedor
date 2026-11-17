@@ -87,11 +87,8 @@ pub struct DesktopApp {
     pub(crate) consumption_confirm_token: u64,
     pub(crate) consumption_processed_tokens: std::collections::HashSet<u64>,
     pub(crate) cash_search: Entity<InputState>,
-    pub(crate) cash_amount_input: Entity<InputState>,
     pub(crate) cash_filter: crate::pages::cash::CashFilter,
-    pub(crate) cash_op_kind: crate::pages::cash::CashOpKind,
     pub(crate) cash_selected_pensioner: Option<u32>,
-    pub(crate) cash_ticket_count: u32,
     pub(crate) cash_confirm_token: u64,
     pub(crate) cash_processed_tokens: std::collections::HashSet<u64>,
     pub(crate) cash_submitting: bool,
@@ -187,11 +184,10 @@ impl DesktopApp {
             economic_lunch_cents: preferences.economic_lunch_cents,
             special_default_cents: preferences.special_default_cents,
         };
-        let cash_search = cx.new(|cx| InputState::new(window, cx).placeholder("Buscar pensionista por nombre o celular"));
+        let cash_search = cx.new(|cx| InputState::new(window, cx).placeholder("Buscar por pensionista, movimiento o responsable"));
         let cash_search_sub = cx.subscribe_in(&cash_search, window, |_, _, event, _, cx| {
             if matches!(event, InputEvent::Change) { cx.notify(); }
         });
-        let cash_amount_input = cx.new(|cx| InputState::new(window, cx).placeholder("0.00"));
         let report_search = cx.new(|cx| InputState::new(window, cx).placeholder("Buscar por pensionista, plato o MOV"));
         let report_search_sub = cx.subscribe_in(&report_search, window, |this, _, event, _, cx| {
             if matches!(event, InputEvent::Change) {
@@ -324,11 +320,8 @@ impl DesktopApp {
             consumption_confirm_token: 1,
             consumption_processed_tokens: std::collections::HashSet::new(),
             cash_search,
-            cash_amount_input,
-            cash_filter: crate::pages::cash::CashFilter::WithDebt,
-            cash_op_kind: crate::pages::cash::CashOpKind::Payment,
+            cash_filter: crate::pages::cash::CashFilter::All,
             cash_selected_pensioner: None,
-            cash_ticket_count: 1,
             cash_confirm_token: 1,
             cash_processed_tokens: std::collections::HashSet::new(),
             cash_submitting: false,

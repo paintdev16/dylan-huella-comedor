@@ -544,83 +544,6 @@ impl MockData {
         Ok((mov_id, expected_cents))
     }
 
-    fn ensure_cash_credit_target(&self, pensioner_id: u32, amount_cents: i64) -> Result<i64, String> {
-        if !self.cash_register.is_open {
-            return Err("La caja está cerrada. Ábrela antes de registrar movimientos.".into());
-        }
-        if amount_cents <= 0 {
-            return Err("El importe debe ser mayor a S/ 0.00.".into());
-        }
-        if !self.pensioners.iter().any(|p| p.id == pensioner_id) {
-            return Err("Pensionista no encontrado.".into());
-        }
-        let debt = self.balance(pensioner_id);
-        if debt == 0 {
-            return Err("El pensionista no tiene deuda pendiente.".into());
-        }
-        if amount_cents > debt {
-            return Err(format!(
-                "El importe (S/ {}.{:02}) supera la deuda pendiente (S/ {}.{:02}).",
-                amount_cents / 100,
-                amount_cents.abs() % 100,
-                debt / 100,
-                debt.abs() % 100
-            ));
-        }
-        Ok(debt)
-    }
-
-    pub fn record_payment(
-        &mut self,
-        date: NaiveDate,
-        time: &str,
-        pensioner_id: u32,
-        amount_cents: i64,
-        request_token: u64,
-        processed_tokens: &mut HashSet<u64>,
-    ) -> Result<String, String> {
-        if processed_tokens.contains(&request_token) {
-            return Err("Este pago ya fue contabilizado (se evitó duplicado).".into());
-        }
-        let debt = self.ensure_cash_credit_target(pensioner_id, amount_cents)?;
-        processed_tokens.insert(request_token);
-        let mov_id = self.next_movement_id();
-        let label = if amount_cents == debt {
-            "Pago completo"
-        } else {
-            "Pago parcial"
-        };
-        self.payments.push(Payment {
-            date,
-            time: time.to_string(),
-            pensioner_id,
-            cents: amount_cents,
-            movement_id: mov_id.clone(),
-            kind: PaymentKind::CashPayment,
-        });
-        let person_name = self
-            .pensioners
-            .iter()
-            .find(|p| p.id == pensioner_id)
-            .map(|p| p.name())
-            .unwrap_or_else(|| "Pensionista".to_string());
-        self.cash_register.movements.push(CashMovement {
-            id: mov_id.clone(),
-            date,
-            time: time.to_string(),
-            kind: CashMovementKind::Payment,
-            pensioner_id: Some(pensioner_id),
-            description: format!("{label} · {person_name}"),
-            cents: amount_cents,
-            operator_name: "Sistema".into(),
-            ticket_count: None,
-            ticket_unit_cents: None,
-            consumption_cents: None,
-            resulting_balance_cents: Some(self.net_balance(pensioner_id)),
-        });
-        Ok(mov_id)
-    }
-
     pub fn record_ticket_credit(
         &mut self,
         date: NaiveDate,
@@ -1382,7 +1305,7 @@ mod tests {
         assert_eq!(data.balance(1), 3200);
     }
     #[test]
-    fn cash_register_payments_tickets_and_idempotency() {
+    fn cash_register_tickets_and_idempotency() {
         let date = NaiveDate::from_ymd_opt(2026, 1, 2).unwrap();
         let mut data = MockData::demo(date);
         let mut tokens = HashSet::new();
@@ -1391,9 +1314,7 @@ mod tests {
         assert_eq!(data.balance(3), 1800);
         assert_eq!(data.cash_register.ticket_value_cents, 700);
 
-        // No permite pagos negativos ni superiores a la deuda
-        assert!(data.record_payment(date, "14:00", 3, -100, 1, &mut tokens).is_err());
-        assert!(data.record_payment(date, "14:00", 3, 2000, 1, &mut tokens).is_err());
+        assert!(data.record_ticket_credit(date, "14:00", 3, 0, 1, &mut tokens).is_err());
 
         // 2 tickets de S/ 7.00 = S/ 14.00 (1400 céntimos), deuda queda en 400
         let mov_t = data
@@ -1405,25 +1326,26 @@ mod tests {
         // Evita contabilizar dos veces el mismo movimiento
         assert!(data.record_ticket_credit(date, "14:05", 3, 2, 2, &mut tokens).is_err());
 
-        // Pago completo del saldo restante (400)
+        // Otro ticket cubre la deuda y genera saldo a favor.
         let mov_p = data
-            .record_payment(date, "14:15", 3, 400, 4, &mut tokens)
+            .record_ticket_credit(date, "14:15", 3, 1, 4, &mut tokens)
             .unwrap();
         assert_eq!(mov_p, "MOV-0005");
         assert_eq!(data.balance(3), 0);
+        assert_eq!(data.credit_balance(3), 300);
 
         // Resumen mensual coherente
         let monthly = data.monthly_summary(3);
         assert_eq!(monthly.len(), 1);
         assert_eq!(monthly[0].consumed_cents, 1800);
-        assert_eq!(monthly[0].tickets_cents, 1400);
-        assert_eq!(monthly[0].cash_paid_cents, 400);
-        assert_eq!(monthly[0].net_balance_cents, 0);
+        assert_eq!(monthly[0].tickets_cents, 2100);
+        assert_eq!(monthly[0].cash_paid_cents, 0);
+        assert_eq!(monthly[0].net_balance_cents, -300);
 
-        // Cierre de caja bloquea nuevos pagos hasta reabrir
+        // Cierre de caja bloquea nuevos abonos hasta reabrir.
         let (_close_id, expected) = data.close_cash_register(date, "20:00", 5, &mut tokens).unwrap();
-        assert_eq!(expected, 10000 + 1000 + 500 + 400);
-        assert!(data.record_payment(date, "20:05", 1, 100, 6, &mut tokens).is_err());
+        assert_eq!(expected, 10000 + 1000 + 500);
+        assert!(data.record_ticket_credit(date, "20:05", 1, 1, 6, &mut tokens).is_err());
         data.open_cash_register(date, "21:00", 5000, 7, &mut tokens)
             .unwrap();
         assert!(data.cash_register.is_open);
@@ -1592,4 +1514,5 @@ mod tests {
         assert_eq!(dash.cash_paid_cents, 1000);
     }
 }
+
 
